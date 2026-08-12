@@ -42,6 +42,8 @@
  *   --input-type          | keyboard / gamepad / zmq / ros2 / interface_manager / gamepad_manager / zmq_manager
  *   --output-type         | zmq / ros2 / all
  *   --disable-crc-check   | Skip CRC validation (for MuJoCo sim)
+ *   --enable-command-q-clamp | Clamp policy q targets to hard joint limits
+ *   --command-max-delta-rad  | Optional per-control-tick q target delta limit
  *   --planner-fp16        | Use FP16 for planner TensorRT engine
  *   --policy-fp16         | Use FP16 for policy TensorRT engine
  */
@@ -53,6 +55,8 @@
 #include <pthread.h>
 #include <sched.h>
 #include <array>
+#include <bit>
+#include <cstdint>
 #include <vector>
 #include <algorithm>
 #include <chrono>
@@ -62,6 +66,7 @@
 #include <unordered_map>
 #include <fstream>
 #include <iostream>
+#include <optional>
 #include <chrono>
 #include <algorithm>
 #include <numeric>
@@ -142,6 +147,18 @@
 using namespace unitree::common;
 using namespace unitree::robot;
 using namespace unitree_hg::msg::dds_;
+
+namespace {
+
+// This target is compiled with -ffast-math, under which std::isfinite may be
+// folded to true.  Inspect IEEE-754 exponent bits so explicitly enabled
+// command safety still fails closed on NaN/Inf policy output and CLI values.
+bool IsFiniteCommandValue(double value) noexcept {
+  constexpr uint64_t kExponentMask = UINT64_C(0x7ff0000000000000);
+  return (std::bit_cast<uint64_t>(value) & kExponentMask) != kExponentMask;
+}
+
+}  // namespace
 
 
 
@@ -323,6 +340,12 @@ class G1Deploy {
     // Default 1.0 allows full closure, use --max-close-ratio to limit
     // Keyboard controls (J/K) always available for runtime adjustment
     double initial_max_close_ratio_ = 1.0;
+
+    // Explicitly opt-in policy-command safety.  Both features are disabled by
+    // default so the legacy command path and policy observation semantics stay
+    // unchanged unless a caller requests them.
+    bool enable_command_q_clamp_ = false;
+    std::optional<double> command_max_delta_rad_;
     
     // Track if vr_3point_compliance is observed by the policy
     // If false, adjusting compliance via keyboard has no effect on the policy
@@ -2159,7 +2182,9 @@ class G1Deploy {
       std::string zmq_out_topic = "g1_debug",
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
-      double initial_max_close_ratio = 1.0)
+      double initial_max_close_ratio = 1.0,
+      bool enable_command_q_clamp = false,
+      std::optional<double> command_max_delta_rad = std::nullopt)
       : time_(0.0),
         publish_dt_(0.002),
         control_dt_(0.02),
@@ -2177,6 +2202,8 @@ class G1Deploy {
         enable_motion_recording_(enable_motion_recording),
         initial_vr_3point_compliance_(initial_compliance),
         initial_max_close_ratio_(initial_max_close_ratio),
+        enable_command_q_clamp_(enable_command_q_clamp),
+        command_max_delta_rad_(command_max_delta_rad),
         //env(ORT_LOGGING_LEVEL_WARNING, "G1Deploy"),
         model_path(model_file_path),
         planner_path(planner_file_path) {
@@ -2700,6 +2727,16 @@ class G1Deploy {
       }
       CreateDampingCommand();
       LowCommandWriter();
+      // Damping has already reached LowCmd, so diagnostics allocation/copying
+      // can never delay the safety-critical shutdown command.  The control
+      // thread is stopped, making this the exact final StateLogger index.
+      if (state_logger_ && state_logger_->size() > 0) {
+        const auto final_entries = state_logger_->GetLatest(1);
+        std::cout << "COMMAND_DIAGNOSTICS_FINAL_INDEX: "
+                  << final_entries.front().index << std::endl;
+      } else {
+        std::cout << "COMMAND_DIAGNOSTICS_FINAL_INDEX: empty" << std::endl;
+      }
       std::cout << "Stop" << std::endl;
     }
 
@@ -3118,15 +3155,90 @@ class G1Deploy {
       auto& action_buffer = policy_engine_->GetActionBuffer();
       float* floatarr = action_buffer.data();
       
+      const bool command_safety_enabled =
+          enable_command_q_clamp_ || command_max_delta_rad_.has_value();
+      std::shared_ptr<const MotorCommand> previous_motor_command;
+      if (command_max_delta_rad_) {
+        previous_motor_command = motor_command_buffer_.GetDataWithTime().data;
+        if (!previous_motor_command) {
+          std::cerr << "✗ Error: Command delta limiting requires a previous motor command"
+                    << std::endl;
+          return false;
+        }
+      }
+
+      std::array<double, G1_NUM_MOTOR> raw_q_des{};
+      std::array<double, G1_NUM_MOTOR> executed_q_des{};
       MotorCommand motor_command_tmp;
       for (int i = 0; i < G1_NUM_MOTOR; i++) {
         const double action_value = static_cast<double>(floatarr[isaaclab_to_mujoco[i]]) * g1_action_scale[i];
         last_action[i] = static_cast<double>(floatarr[i]);
-        motor_command_tmp.q_target.at(i) = static_cast<float>(default_angles[i] + action_value);
+        raw_q_des[i] = default_angles[i] + action_value;
+
+        double executed_target = raw_q_des[i];
+        if (command_safety_enabled) {
+          // Preserve the legacy unchecked path when safety is disabled.  Once
+          // explicitly enabled, never allow a non-finite target into LowCmd.
+          if (!IsFiniteCommandValue(executed_target)) {
+            std::cerr << "✗ Error: Non-finite raw q target for motor " << i << std::endl;
+            return false;
+          }
+
+          if (enable_command_q_clamp_) {
+            executed_target = std::clamp(
+                executed_target,
+                G1_JOINT_POSITION_LOWER_LIMITS[i],
+                G1_JOINT_POSITION_UPPER_LIMITS[i]);
+          }
+
+          if (command_max_delta_rad_) {
+            const double previous_target =
+                static_cast<double>(previous_motor_command->q_target.at(i));
+            if (!IsFiniteCommandValue(previous_target)) {
+              std::cerr << "✗ Error: Non-finite previous q target for motor " << i
+                        << std::endl;
+              return false;
+            }
+            const double lower_delta_bound = previous_target - *command_max_delta_rad_;
+            const double upper_delta_bound = previous_target + *command_max_delta_rad_;
+            if (!IsFiniteCommandValue(lower_delta_bound) ||
+                !IsFiniteCommandValue(upper_delta_bound)) {
+              std::cerr << "✗ Error: Non-finite command delta bounds for motor " << i
+                        << std::endl;
+              return false;
+            }
+            executed_target = std::clamp(
+                executed_target, lower_delta_bound, upper_delta_bound);
+          }
+
+          // Re-apply hard limits after rate limiting so both enabled
+          // constraints hold even if a previous target was outside the range.
+          if (enable_command_q_clamp_) {
+            executed_target = std::clamp(
+                executed_target,
+                G1_JOINT_POSITION_LOWER_LIMITS[i],
+                G1_JOINT_POSITION_UPPER_LIMITS[i]);
+          }
+        }
+
+        motor_command_tmp.q_target.at(i) = static_cast<float>(executed_target);
+        executed_q_des[i] = static_cast<double>(motor_command_tmp.q_target.at(i));
+        if (command_safety_enabled && !IsFiniteCommandValue(executed_q_des[i])) {
+          std::cerr << "✗ Error: Non-finite executed q target for motor " << i << std::endl;
+          return false;
+        }
         motor_command_tmp.tau_ff.at(i) = 0.0;
         motor_command_tmp.kp.at(i) = kps[i];
         motor_command_tmp.kd.at(i) = kds[i];
         motor_command_tmp.dq_target.at(i) = 0.0;
+      }
+
+      if (command_safety_enabled &&
+          (!state_logger_ ||
+           !state_logger_->LogCommandTargets(std::span(raw_q_des),
+                                             std::span(executed_q_des)))) {
+        std::cerr << "✗ Error: Failed to log current command targets" << std::endl;
+        return false;
       }
       motor_command_buffer_.SetData(motor_command_tmp);
       return true;
@@ -4117,6 +4229,8 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --planner-motion-logfile <path>: write planner motion to a csv file if provided" << std::endl;
     std::cout << "  --policy-input-logfile <path>: write policy input tensors to a csv file if provided" << std::endl;
     std::cout << "  --disable-crc-check: disable CRC validation for MuJoCo simulation" << std::endl;
+    std::cout << "  --enable-command-q-clamp: clamp policy q targets to hard G1 joint limits (default: disabled)" << std::endl;
+    std::cout << "  --command-max-delta-rad <rad>: limit each q target change per 50 Hz control tick (default: disabled)" << std::endl;
     std::cout << "  --obs-config <path>: specify observation configuration YAML file" << std::endl;
     std::cout << "  --encoder-file <path>: specify encoder ONNX file (optional)" << std::endl;
     std::cout << "  --planner-precision <16|32>: specify precision to run the planner model at (default: 16)" << std::endl;
@@ -4180,10 +4294,37 @@ int main(int argc, char const* argv[]) {
   std::string zmq_out_topic = "g1_debug";
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
+  bool enableCommandQClamp = false;
+  std::optional<double> commandMaxDeltaRad;
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
       std::cout << "[INFO] CRC checking disabled for MuJoCo simulation" << std::endl;
+    } else if (std::string(argv[i]) == "--enable-command-q-clamp") {
+      enableCommandQClamp = true;
+      std::cout << "[INFO] Policy command q-target hard clamp enabled" << std::endl;
+    } else if (std::string(argv[i]) == "--command-max-delta-rad") {
+      if (i + 1 >= argc) {
+        std::cerr << "Error: --command-max-delta-rad requires a positive finite value"
+                  << std::endl;
+        exit(1);
+      }
+      const std::string value = argv[++i];
+      try {
+        size_t parsed_characters = 0;
+        const double parsed_value = std::stod(value, &parsed_characters);
+        if (parsed_characters != value.size() || !IsFiniteCommandValue(parsed_value) ||
+            parsed_value <= 0.0) {
+          throw std::invalid_argument("invalid command delta");
+        }
+        commandMaxDeltaRad = parsed_value;
+        std::cout << "[INFO] Policy command max delta set to " << parsed_value
+                  << " rad per control tick" << std::endl;
+      } catch (const std::exception&) {
+        std::cerr << "Error: --command-max-delta-rad must be a positive finite number"
+                  << std::endl;
+        exit(1);
+      }
     } else if (std::string(argv[i]) == "--obs-config") {
       if (i + 1 < argc) {
         obsConfigPath = argv[i + 1];
@@ -4441,7 +4582,9 @@ int main(int argc, char const* argv[]) {
     zmq_out_topic,
     enableMotionRecording,
     initial_compliance,
-    initial_max_close_ratio
+    initial_max_close_ratio,
+    enableCommandQClamp,
+    commandMaxDeltaRad
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   
@@ -4468,4 +4611,3 @@ int main(int argc, char const* argv[]) {
   std::cout << "[DEBUG] Program exiting normally..." << std::endl;
   return 0;
 }
-

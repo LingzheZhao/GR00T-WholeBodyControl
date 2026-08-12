@@ -21,7 +21,7 @@
  * ## `{user_topic}` (e.g. `g1_debug`) — published every tick
  * ---------------------------------------------------------------------------
  *
- * A single msgpack map with up to 30 keys (28 always-present + 2 conditional).
+ * A single msgpack map with up to 33 keys (29 always-present + 4 conditional).
  * All joints are in **MuJoCo order** (remapped from IsaacLab via
  * `isaaclab_to_mujoco`).
  *
@@ -49,33 +49,36 @@
  *  13  | right_hand_dq          | double[7]    | Right-hand joint velocities.
  *      |                        |              |
  *      | **Policy actions**     |              |
- *  14  | last_action            | double[29]   | Last body action (scaled + default offsets).
- *  15  | last_left_hand_action  | double[7]    | Last left-hand action.
- *  16  | last_right_hand_action | double[7]    | Last right-hand action.
+ *  14  | last_action            | double[29]   | Legacy previous-tick action target.
+ *  15  | raw_q_des              | double[29]   | Current raw target (conditional: command safety enabled).
+ *  16  | executed_q_des         | double[29]   | Current MotorCommand target (same condition/tick as raw_q_des).
+ *  17  | last_left_hand_action  | double[7]    | Last left-hand action.
+ *  18  | last_right_hand_action | double[7]    | Last right-hand action.
  *      |                        |              |
  *      | **Encoder**            |              |
- *  17  | token_state            | double[N]    | Encoder token state (empty array if N/A).
+ *  19  | token_state            | double[N]    | Encoder token state (empty array if N/A).
+ *  20  | motor_temperature      | double[58]   | Winding/driver temperatures for 29 motors.
  *      |                        |              |
  *      | **Heading** *(conditional — only when heading state is available)* |
- *  18  | init_base_quat         | double[4]    | Initial base quaternion at heading init.
- *  19  | delta_heading          | double       | Accumulated heading delta (rad).
+ *  21  | init_base_quat         | double[4]    | Initial base quaternion at heading init.
+ *  22  | delta_heading          | double       | Accumulated heading delta (rad).
  *      |                        |              |
  *      | **Viz: targets** *(from current motion frame + heading correction)* |
- *  20  | base_trans_target      | double[3]    | Target base translation.
- *  21  | base_quat_target       | double[4]    | Target base quaternion.
- *  22  | body_q_target          | double[29]   | Target joint positions.
+ *  23  | base_trans_target      | double[3]    | Target base translation.
+ *  24  | base_quat_target       | double[4]    | Target base quaternion.
+ *  25  | body_q_target          | double[29]   | Target joint positions.
  *      |                        |              |
  *      | **Viz: measured**      |              |
- *  23  | base_trans_measured    | double[3]    | Measured base translation (fixed default).
- *  24  | base_quat_measured     | double[4]    | Measured base quaternion (= base_quat).
- *  25  | body_q_measured        | double[29]   | Measured joint positions (= body_q).
- *  26  | left_hand_q_measured   | double[7]    | Measured left-hand Dex3 positions.
- *  27  | right_hand_q_measured  | double[7]    | Measured right-hand Dex3 positions.
+ *  26  | base_trans_measured    | double[3]    | Measured base translation (fixed default).
+ *  27  | base_quat_measured     | double[4]    | Measured base quaternion (= base_quat).
+ *  28  | body_q_measured        | double[29]   | Measured joint positions (= body_q).
+ *  29  | left_hand_q_measured   | double[7]    | Measured left-hand Dex3 positions.
+ *  30  | right_hand_q_measured  | double[7]    | Measured right-hand Dex3 positions.
  *      |                        |              |
  *      | **Viz: VR 3-point**    |              |
- *  28  | vr_3point_position     | double[9]    | VR positions (3×xyz, target body frame).
- *  29  | vr_3point_orientation  | double[12]   | VR orientations (3×quat wxyz).
- *  30  | vr_3point_compliance   | double[3]    | VR compliance (left arm, right arm, head).
+ *  31  | vr_3point_position     | double[9]    | VR positions (3×xyz, target body frame).
+ *  32  | vr_3point_orientation  | double[12]   | VR orientations (3×quat wxyz).
+ *  33  | vr_3point_compliance   | double[3]    | VR compliance (left arm, right arm, head).
  *
  * ---------------------------------------------------------------------------
  * ## `robot_config` — re-published every ~2 s
@@ -279,9 +282,12 @@ private:
             has_heading_state = true;
         }
 
-        // State-logger fields: 18 base + 2 optional heading
+        // State-logger fields: 18 base + 2 optional heading + 2 optional
+        // same-tick command targets.
         // Visualisation fields: output_data_map_.size() (typically 11)
-        int num_state_fields = has_heading_state ? 20 : 18;
+        const bool has_command_targets = state.has_command_targets;
+        int num_state_fields = (has_heading_state ? 20 : 18) +
+                               (has_command_targets ? 2 : 0);
         int num_viz_fields = static_cast<int>(output_data_map_.size());
         pk.pack_map(num_state_fields + num_viz_fields);
 
@@ -346,6 +352,18 @@ private:
             for (const auto& val : last_action_mujoco) pk.pack(val);
         } else {
             for (const auto& val : state.last_action) pk.pack(val);
+        }
+
+        // Current-tick command targets are already in hardware / MuJoCo order.
+        // They are present only when an explicit command-safety option is active.
+        if (has_command_targets) {
+            pk.pack("raw_q_des");
+            pk.pack_array(state.raw_q_des.size());
+            for (const auto& val : state.raw_q_des) pk.pack(val);
+
+            pk.pack("executed_q_des");
+            pk.pack_array(state.executed_q_des.size());
+            for (const auto& val : state.executed_q_des) pk.pack(val);
         }
 
         pk.pack("left_hand_q");

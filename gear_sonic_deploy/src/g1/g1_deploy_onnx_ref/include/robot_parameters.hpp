@@ -32,6 +32,39 @@ static const std::string HG_STATE_TOPIC = "rt/lowstate";    ///< Low-level motor
 const int G1_NUM_MOTOR = 29;
 
 /**
+ * @brief Hard joint-position limits for the 29-DOF G1, in hardware / MuJoCo order.
+ *
+ * These values intentionally match `g1/g1_29dof.xml`.  They are not the
+ * narrower training-time soft limits and do not include an additional margin.
+ */
+inline constexpr std::array<double, G1_NUM_MOTOR> G1_JOINT_POSITION_LOWER_LIMITS = {
+    -2.5307, -0.5236, -2.7576, -0.087267, -0.87267, -0.2618,
+    -2.5307, -2.9671, -2.7576, -0.087267, -0.87267, -0.2618,
+    -2.618, -0.52, -0.52,
+    -3.0892, -1.5882, -2.618, -1.0472, -1.97222, -1.61443, -1.61443,
+    -3.0892, -2.2515, -2.618, -1.0472, -1.97222, -1.61443, -1.61443,
+};
+
+inline constexpr std::array<double, G1_NUM_MOTOR> G1_JOINT_POSITION_UPPER_LIMITS = {
+    2.8798, 2.9671, 2.7576, 2.8798, 0.5236, 0.2618,
+    2.8798, 0.5236, 2.7576, 2.8798, 0.5236, 0.2618,
+    2.618, 0.52, 0.52,
+    2.6704, 2.2515, 2.618, 2.0944, 1.97222, 1.61443, 1.61443,
+    2.6704, 1.5882, 2.618, 2.0944, 1.97222, 1.61443, 1.61443,
+};
+
+constexpr bool G1JointPositionLimitsAreValid() {
+  for (int i = 0; i < G1_NUM_MOTOR; ++i) {
+    if (!(G1_JOINT_POSITION_LOWER_LIMITS[i] < G1_JOINT_POSITION_UPPER_LIMITS[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static_assert(G1JointPositionLimitsAreValid(), "G1 joint-position limits must be ordered");
+
+/**
  * @brief Per-joint motor command sent to the low-level controller.
  *
  * Each field is an array of size G1_NUM_MOTOR (29), indexed by hardware joint

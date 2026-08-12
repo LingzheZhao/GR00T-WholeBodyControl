@@ -63,6 +63,7 @@
 #include <map>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <string>
 #include <utility>
 #include <variant>
@@ -93,6 +94,13 @@ class StateLogger {
     std::vector<double> body_q;       // size = num_joints
     std::vector<double> body_dq;      // size = num_joints
     std::vector<double> last_action;  // size = num_actions
+
+    // Command targets generated later in this same control tick.  These are
+    // deliberately separate from last_action: last_action is the previous raw
+    // policy action used by the policy's observation history.
+    bool has_command_targets = false;
+    std::vector<double> raw_q_des;       // hardware / MuJoCo order, radians
+    std::vector<double> executed_q_des;  // exact MotorCommand q_target values
 
     // Motor temperature (2 values per motor: winding temp, driver temp)
     std::vector<double> motor_temperature;  // size = num_joints * 2
@@ -183,6 +191,14 @@ class StateLogger {
    * @param play Operator play state (controls motion playback)
    */
   bool LogPostState(const std::span<double>& token_state, int encoder_mode = -2, const std::string& motion_name = "", bool play = false);
+
+  /**
+   * Attach raw and executed position targets to the current tick's newest
+   * entry.  Must be called after LogFullState and at most once per entry.
+   * Returns false for missing/duplicate entries or invalid vector dimensions.
+   */
+  bool LogCommandTargets(std::span<const double> raw_q_des,
+                         std::span<const double> executed_q_des);
 
   size_t capacity() const;
   size_t size() const;

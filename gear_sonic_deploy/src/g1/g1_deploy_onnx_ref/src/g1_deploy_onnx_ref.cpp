@@ -2394,6 +2394,13 @@ class G1Deploy {
         std::cout << "✓ Encoder model loaded successfully!" << std::endl;
         is_using_encoder_ = true;
         initial_encoder_mode_ = 0;  // Encoder available, default to mode 0.
+        // SONIC_FORCE_ENCODE_MODE overrides the initial mode (e.g. 2 = smpl:
+        // track SMPL joint references directly, no retargeted G1 channels)
+        if (const char* fm = std::getenv("SONIC_FORCE_ENCODE_MODE")) {
+          initial_encoder_mode_ = std::atoi(fm);
+          std::cout << "⚠ SONIC_FORCE_ENCODE_MODE=" << initial_encoder_mode_
+                    << " — forcing initial encoder mode" << std::endl;
+        }
       } else {
         if (encoder_config_.dimension > 0) {
           std::cout << "Encoder config found but no encoder file provided - tokens can be set externally" << std::endl;

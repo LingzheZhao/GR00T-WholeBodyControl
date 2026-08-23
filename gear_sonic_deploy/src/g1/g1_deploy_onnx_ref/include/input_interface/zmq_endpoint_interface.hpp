@@ -58,6 +58,8 @@
 #include <termios.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <atomic>
+#include <chrono>
 #include <iostream>
 #include <iomanip>
 #include <memory>
@@ -66,6 +68,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
+#include <optional>
 
 #include "input_interface.hpp"
 #include "zmq_packed_message_subscriber.hpp"
@@ -121,6 +124,57 @@ public:
     std::shared_ptr<MotionSequence> streamed_motion_;
     /// Global frame index corresponding to streamed_motion_[0].
     int stream_window_start_ = 0;
+
+    // ------------------------------------------------------------------
+    // Declared stream kind (SONIC_EXPECTED_STREAM_MODE)
+    // ------------------------------------------------------------------
+    // The encoder mode a streamed window ends up in is chosen by the
+    // PUBLISHER, through the pose protocol version it sends (see
+    // EncodeModeForProtocolVersion below).  Nothing else in this process gets
+    // a vote, so a publisher that streams the wrong kind silently drives the
+    // policy off the wrong observations -- and for an SMPL bundle read as
+    // mode 0 that means a straight-legged zero pose at 50 Hz.
+    //
+    // The operator can therefore DECLARE what the publisher is supposed to
+    // send, and every window that disagrees is dropped before it can replace
+    // current_motion.  The declaration is resolved once at startup from
+    // SONIC_EXPECTED_STREAM_MODE (see ResolveExpectedStreamMode() in
+    // g1_deploy_onnx_ref.cpp) and pushed in here; -1 means "no expectation",
+    // which is upstream behaviour.
+
+    /// Number of SMPL joints this policy's observation registry is sized for.
+    /// Kept in sync with kSonicSmplJointCount in g1_deploy_onnx_ref.cpp, where
+    /// the gather that consumes these windows enforces the same contract:
+    /// smpl_joints_10frame_step1 is 720 doubles = 24 joints * 3 * 10 frames.
+    static constexpr int kRequiredSmplJoints = 24;
+
+    /// Declare the encoder mode streamed windows must map to (-1 = accept any).
+    void SetExpectedStreamMode(int mode) { expected_stream_mode_ = mode; }
+    /// The declared stream mode, or -1 when none was declared.
+    int GetExpectedStreamMode() const { return expected_stream_mode_; }
+
+    /// Encoder mode a streamed window is stamped with, derived from its pose
+    /// protocol version: v1 carries retargeted G1 joints (mode 0), v2 and v3
+    /// carry SMPL (mode 2).  Returns -1 for versions that carry no reference
+    /// motion at all -- v4 is token-only -- so a declared expectation refuses
+    /// those too rather than letting them through unexamined.
+    ///
+    /// This is the single source of truth for the mapping: the stamp applied
+    /// to every merged window below calls it as well.
+    static int EncodeModeForProtocolVersion(int protocol_version) {
+        if (protocol_version == 1) { return 0; }
+        if (protocol_version == 2 || protocol_version == 3) { return 2; }
+        return -1;
+    }
+
+    /// True exactly once per transition into ZMQ streaming, then false again.
+    ///
+    /// The controller uses it to forget which encoder mode it last logged, so
+    /// the first streamed window always re-announces its mode even when the
+    /// pre-streaming window happened to run the same one.  A supervisor that
+    /// requires that announcement after its stream barrier would otherwise
+    /// fail a perfectly correct run.
+    bool ConsumeStreamEnabled() { return stream_enabled_latch_.exchange(false); }
 
     static constexpr std::string_view LOCALHOST = "localhost";
 
@@ -316,6 +370,11 @@ public:
                 std::cout << "=====================================" << std::endl;
                 std::cout << "ZMQ STREAMING MODE: ENABLED" << std::endl;
                 std::cout << "=====================================" << std::endl;
+                // Streaming starts here, so whatever encoder mode the
+                // pre-streaming window ran is no longer the mode of record.
+                // Latch that, so the controller re-logs the mode of the first
+                // streamed window unconditionally.
+                stream_enabled_latch_.store(true);
                 std::cout << "Using pose data from " << host_ << ":" << port_ << std::endl;
                 std::cout << "Press ENTER again to return to loaded motions" << std::endl;
                 // reset the heading state
@@ -643,6 +702,38 @@ private:
         int protocol_version = buffered_header_.version;
         if constexpr (DEBUG_LOGGING) {
             std::cout << "[ZMQEndpointInterface] Protocol version: " << protocol_version << std::endl;
+        }
+
+        // ===== STEP 0: Enforce the declared stream kind =====
+        //
+        // Refuse here, before anything is decoded, before active_protocol_version_
+        // is established and before the merger's sliding window is touched: a
+        // refused window must leave the previous motion, the previous encoder
+        // mode and the merge state exactly as they were.  Refusing after the
+        // version had been latched would also turn the first CORRECT window
+        // into a "protocol version changed" error, which tears down streaming
+        // altogether.
+        //
+        // An empty DecodeResult (motion == nullptr, protocol_version == 0) is
+        // the caller's "nothing new this tick" case: handle_input() leaves
+        // current_motion, current_frame and operator_state.play untouched, so
+        // playback keeps running out the last accepted window and then holds
+        // its final pose.
+        if (expected_stream_mode_ >= 0) {
+            const int incoming_mode = EncodeModeForProtocolVersion(protocol_version);
+            if (incoming_mode != expected_stream_mode_) {
+                // Rate-limited to once per second: a misconfigured publisher
+                // streams at 30-50 Hz, and flooding the controller's PTY would
+                // push the operator's own diagnostics off the screen.
+                const auto now = std::chrono::steady_clock::now();
+                if (!last_stream_mode_refusal_log_ ||
+                    now - *last_stream_mode_refusal_log_ >= std::chrono::seconds(1)) {
+                    last_stream_mode_refusal_log_ = now;
+                    std::cout << "STREAM_MODE_REFUSED: expected=" << expected_stream_mode_
+                              << " got=" << incoming_mode << std::endl;
+                }
+                return result;
+            }
         }
         
         // Find expected fields by name (including frame_index for alignment)
@@ -1128,6 +1219,20 @@ private:
                 has_smpl_joints = false; // Invalid shape, skip decoding
             }
             
+            // The count above comes straight off the wire, and downstream the
+            // encoder gather strides by it into a buffer whose SMPL slot is
+            // sized for exactly kRequiredSmplJoints joints
+            // (smpl_joints_10frame_step1 = 720 = 24*3*10) using an unchecked
+            // operator[].  A publisher announcing more than 24 joints would
+            // therefore write past the end of the encoder input.  Refuse the
+            // window instead; like STREAM_MODE_REFUSED above, that leaves the
+            // last accepted window in force.
+            if (has_smpl_joints && num_smpl_joints != kRequiredSmplJoints) {
+                std::cerr << "SMPL_JOINT_COUNT_REFUSED: expected=" << kRequiredSmplJoints
+                          << " got=" << num_smpl_joints << std::endl;
+                return result;
+            }
+
             if (has_smpl_joints && num_smpl_joints > 0) {
                 decoded_smpl_joints.resize(num_frames);
                 
@@ -1702,12 +1807,12 @@ private:
             return result;
         }
         
-        // Convert MergeResult to DecodeResult
-        if (active_protocol_version_ == 1) {
-            merge_result.motion->SetEncodeMode(0);  // Protocol 1: joint-based
-        } else if (active_protocol_version_ == 2 || active_protocol_version_ == 3) {
-            // Protocol versions 2 and 3 both use encoder mode 2 (SMPL-based)
-            merge_result.motion->SetEncodeMode(2);
+        // Convert MergeResult to DecodeResult.  The version -> mode mapping
+        // lives in EncodeModeForProtocolVersion() so that the declared-kind
+        // gate at STEP 0 and this stamp can never drift apart.
+        const int merged_encode_mode = EncodeModeForProtocolVersion(active_protocol_version_);
+        if (merged_encode_mode >= 0) {
+            merge_result.motion->SetEncodeMode(merged_encode_mode);
         }
         result.motion = merge_result.motion;
         result.window_start = merge_result.window_start;
@@ -1846,6 +1951,15 @@ private:
     // ------------------------------------------------------------------
     // Thread-safe data buffering (written by ZMQ subscriber thread, read by input thread)
     // ------------------------------------------------------------------
+    /// Declared encoder mode for streamed windows (-1 = no expectation).
+    /// Written once at startup before any thread runs; read by the input
+    /// thread only.
+    int expected_stream_mode_ = -1;
+    /// Last time a STREAM_MODE_REFUSED line was printed (rate limiting).
+    std::optional<std::chrono::steady_clock::time_point> last_stream_mode_refusal_log_;
+    /// Set when streaming is enabled, cleared by ConsumeStreamEnabled().
+    std::atomic<bool> stream_enabled_latch_{false};
+
     mutable std::mutex data_mutex_;           ///< Guards the fields below.
     bool has_new_data_ = false;               ///< True when a new message is waiting to be decoded.
     ZMQPackedMessageSubscriber::DecodedHeader buffered_header_;  ///< Latest JSON header.

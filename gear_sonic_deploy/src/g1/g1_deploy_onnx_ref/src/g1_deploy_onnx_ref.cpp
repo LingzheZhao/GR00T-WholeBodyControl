@@ -52,7 +52,9 @@
 #include <cuda_runtime_api.h>
 #include <cctype>
 #include <cerrno>
+#include <csignal>
 #include <cstdlib>
+#include <thread>
 #include <limits>
 #include <sstream>
 #include <string>
@@ -181,6 +183,33 @@ bool IsFiniteCommandValue(double value) noexcept {
 // So the controller prints one machine-readable capability line on stdout and
 // refuses any override value it cannot validate against the loaded config.
 
+// Number of SMPL joints this policy's observation registry is sized for.  The
+// registry hardcodes the slot widths -- smpl_joints_10frame_step1 is 720
+// doubles = 24 joints * 3 coordinates * 10 frames -- while the gather that
+// fills them strides by the joint count of the motion actually loaded, which
+// for a streamed window comes off the wire.  24 is therefore a contract, not a
+// default, and both ends check it: ZMQEndpointInterface::kRequiredSmplJoints
+// refuses the window, the gather below refuses the bundle.
+constexpr size_t kSonicSmplJointCount = 24;
+
+// "No encoder mode has been logged yet."  Deliberately not a mode id, and not
+// -1 or -2 either, both of which are real initial_encoder_mode_ values for a
+// controller running without an encoder.
+constexpr int kEncoderModeNeverLogged = -999;
+
+// Set by the SIGINT / SIGTERM handler, polled by the main wait loop.
+//
+// Without a handler, Ctrl+C and `docker stop` terminate the process outright:
+// Stop() never runs, no damping command is ever published, and the robot is
+// left holding the last full-gain policy target until its own motor watchdog
+// gives up.  volatile std::sig_atomic_t is the only object a handler may
+// touch portably, and storing to it is the only thing the handler does.
+volatile std::sig_atomic_t g_shutdown_requested = 0;
+
+extern "C" void HandleShutdownSignal(int /*signal_number*/) {
+  g_shutdown_requested = 1;
+}
+
 // Escapes the two characters that would break a double-quoted JSON string.
 // Mode names are read from a YAML file on disk, so they are not trusted to be
 // JSON-clean even though the shipped configs only use plain identifiers.
@@ -214,41 +243,43 @@ std::string BuildSonicCapabilityLine(const std::vector<EncoderModeConfig>& encod
          << ",\"name\":\"" << JsonEscape(encoder_modes[i].name) << "\"}";
   }
   // The accepted pose-protocol versions are hardcoded because the mapping from
-  // protocol version to encoder mode lives in code, not in config: see the
-  // active_protocol_version_ dispatch in
-  // include/input_interface/zmq_endpoint_interface.hpp (~:1705), where v1 sets
-  // encode mode 0 and v2/v3 both set encode mode 2 on every merged window.
+  // protocol version to encoder mode lives in code, not in config: see
+  // ZMQEndpointInterface::EncodeModeForProtocolVersion() in
+  // include/input_interface/zmq_endpoint_interface.hpp, where v1 sets encode
+  // mode 0 and v2/v3 both set encode mode 2 on every merged window.
   line << "],\"pose_protocol_versions\":[1,2,3]"
        << ",\"force_encode_mode_env\":true"
        << ",\"initial_encoder_mode\":" << initial_encoder_mode << "}";
   return line.str();
 }
 
-// Resolves the initial encoder mode, applying the SONIC_FORCE_ENCODE_MODE
-// override if it is set AND valid.
+// Strictly parses an encoder-mode id out of the environment variable `name`.
 //
-// The previous implementation used std::atoi, which cannot fail: "smpl", "2x",
-// " " and "" all parse to 0 -- and 0 is exactly the mode that is unsafe for an
-// SMPL bundle, because gathering mode-0 observations off the zero-filled
-// joint_pos SUCCEEDS.  A typo in the launcher would therefore have silently
-// downgraded an intended SMPL run into a zero-pose command stream.  So require
-// the whole string to be consumed by strtol, and require the resulting id to be
-// one of the modes the loaded config actually declares.
+// Returns std::nullopt when the variable is unset; otherwise a mode id that
+// the loaded observation config really declares.  Anything else prints
+// "<name> invalid: '<value>'" on stdout and exits(1).
 //
-// Failure aborts the process.  This runs during construction, long before DDS,
+// std::atoi cannot fail: "smpl", "2x", " " and "" all parse to 0 -- and 0 is
+// exactly the mode that is unsafe for an SMPL bundle, because gathering mode-0
+// observations off the zero-filled joint_pos SUCCEEDS.  A typo in the launcher
+// would therefore silently downgrade an intended SMPL run into a zero-pose
+// command stream.  So require the whole string to be consumed by strtol, and
+// require the resulting id to be one of the modes the loaded config declares.
+//
+// Failure aborts the process.  Both callers run at startup, long before DDS,
 // the control threads or any motor command exists, so exiting is the safe
 // outcome: there is no robot state to wind down yet.
-int ResolveInitialEncodeMode(int default_mode,
-                             const std::vector<EncoderModeConfig>& encoder_modes) {
-  const char* forced = std::getenv("SONIC_FORCE_ENCODE_MODE");
-  if (forced == nullptr) {
-    return default_mode;
+std::optional<int> ParseEncoderModeEnv(const char* name,
+                                       const std::vector<EncoderModeConfig>& encoder_modes) {
+  const char* raw = std::getenv(name);
+  if (raw == nullptr) {
+    return std::nullopt;
   }
 
-  const std::string value(forced);
+  const std::string value(raw);
   // Single rejection path so every invalid form emits the identical marker.
-  auto reject = [&value]() {
-    std::cout << "SONIC_FORCE_ENCODE_MODE invalid: '" << value << "'" << std::endl;
+  auto reject = [name, &value]() {
+    std::cout << name << " invalid: '" << value << "'" << std::endl;
     std::exit(1);
   };
 
@@ -273,8 +304,9 @@ int ResolveInitialEncodeMode(int default_mode,
 
   const int mode_id = static_cast<int>(parsed);
   // A syntactically valid id that this config does not declare is still a
-  // misconfiguration: it would land in modes_to_try, fail the mode lookup and
-  // fall through to whatever mode does gather -- mode 0 again.
+  // misconfiguration: forced, it would land in modes_to_try, fail the mode
+  // lookup and fall through to whatever mode does gather -- mode 0 again;
+  // expected, it would refuse every window the publisher could ever send.
   const bool declared = std::any_of(
       encoder_modes.begin(), encoder_modes.end(),
       [mode_id](const EncoderModeConfig& mode) { return mode.mode_id == mode_id; });
@@ -282,9 +314,52 @@ int ResolveInitialEncodeMode(int default_mode,
     reject();
   }
 
-  std::cout << "⚠ SONIC_FORCE_ENCODE_MODE=" << mode_id
-            << " — forcing initial encoder mode" << std::endl;
   return mode_id;
+}
+
+// Resolves the initial encoder mode of the PRELOADED motions, applying the
+// SONIC_FORCE_ENCODE_MODE override if it is set and valid.
+//
+// This governs the reference/example bundles read off disk, which are what the
+// controller tracks during the pre-streaming CONTROL window -- not what the
+// ZMQ stream is tracked in.  Those bundles are robot bundles: forcing mode 2
+// here makes the mode-2 gather fail on the very first CONTROL tick (they carry
+// no smpl_joint.csv), and with the fail-closed gather that damps the robot out
+// before streaming has even been enabled.  The stream's own mode is chosen
+// per-window by the pose protocol version and is guarded by
+// SONIC_EXPECTED_STREAM_MODE below.
+int ResolveInitialEncodeMode(int default_mode,
+                             const std::vector<EncoderModeConfig>& encoder_modes) {
+  const std::optional<int> forced =
+      ParseEncoderModeEnv("SONIC_FORCE_ENCODE_MODE", encoder_modes);
+  if (!forced) {
+    return default_mode;
+  }
+  std::cout << "⚠ SONIC_FORCE_ENCODE_MODE=" << *forced
+            << " — forcing initial encoder mode" << std::endl;
+  return *forced;
+}
+
+// Resolves the encoder mode streamed windows are REQUIRED to map to, from
+// SONIC_EXPECTED_STREAM_MODE.  Returns -1 when the variable is unset, which is
+// upstream behaviour: every window the publisher sends is accepted.
+//
+// The mode a streamed window runs in is chosen by the publisher, through the
+// pose protocol version it puts in each message (v1 -> mode 0, v2/v3 -> mode
+// 2).  The operator, who knows which reference was approved for this run, has
+// no way to hold the publisher to it -- so this lets the run DECLARE the mode
+// and drop every window that disagrees, in the endpoint interface, before the
+// window can become current_motion.
+int ResolveExpectedStreamMode(const std::vector<EncoderModeConfig>& encoder_modes) {
+  const std::optional<int> expected =
+      ParseEncoderModeEnv("SONIC_EXPECTED_STREAM_MODE", encoder_modes);
+  if (!expected) {
+    return -1;
+  }
+  std::cout << "SONIC_EXPECTED_STREAM_MODE=" << *expected
+            << " — streamed windows that map to any other encoder mode will be refused"
+            << std::endl;
+  return *expected;
 }
 
 }  // namespace
@@ -500,7 +575,14 @@ class G1Deploy {
     EncoderConfig encoder_config_;  // Encoder configuration from observation config
     bool is_using_encoder_ = false;
     int initial_encoder_mode_ = -2;  // -2: no token state. -1: need token state but no encoder. 0,1,2,...: encoder mode.
-    int last_logged_encoder_mode_ = -999;  // Track last logged mode to avoid spam
+    // Track last logged mode to avoid spam.  Atomic because the control thread
+    // updates it while the input thread resets it on every transition into ZMQ
+    // streaming (see Input()).
+    std::atomic<int> last_logged_encoder_mode_{kEncoderModeNeverLogged};
+    /// Encoder mode streamed windows must map to, or -1 for "accept any".
+    /// Resolved once from SONIC_EXPECTED_STREAM_MODE and handed to the ZMQ
+    /// endpoint interface; see ResolveExpectedStreamMode().
+    int expected_stream_mode_ = -1;
     
     // Token input safety tracking
     bool first_token_received_ = false;  // True once we've received at least one token
@@ -1065,6 +1147,24 @@ class G1Deploy {
         std::cerr << "✗ Error: Motion has no SMPL joints - cannot gather SMPL joint data" << std::endl;
         return false;
       }
+      // The registry entries that call this gather have FIXED widths computed
+      // from kSonicSmplJointCount (smpl_joints_10frame_step1 = 720 = 24*3*10),
+      // but the count above belongs to whatever motion is current: a bundle
+      // read off disk, or a window merged from the network.  The writes below
+      // index target_buffer with an unchecked operator[] and stride by that
+      // runtime count, so a motion carrying more than 24 joints writes past
+      // the observation slot -- and past the buffer.  Refuse instead.
+      //
+      // Returning false is the fail-closed path: when mode 2 was intended,
+      // GatherEncoderObservations offers no fallback, so the run stops and
+      // Stop() damps the robot rather than feeding the encoder garbage.
+      if (num_smpl_joints != kSonicSmplJointCount) {
+        std::cerr << "✗ Error: motion has " << num_smpl_joints
+                  << " SMPL joints, but this policy's observations are sized for "
+                  << kSonicSmplJointCount << " - refusing to gather SMPL joint data"
+                  << std::endl;
+        return false;
+      }
       // Validate requested SMPL joint indexes
       for (int idx : smpl_indexes) {
         if (idx < 0 || idx >= static_cast<int>(num_smpl_joints)) {
@@ -1073,6 +1173,20 @@ class G1Deploy {
                     << "] in GatherMotionSmplJointsMultiFrame" << std::endl;
           return false;
         }
+      }
+      // Second belt on the same hazard, this one independent of the joint
+      // count: refuse if the requested window does not fit the slot the
+      // registry handed us.  Cheap (once per gather) and it turns any future
+      // registry/config mismatch into a refusal instead of a heap overwrite.
+      const size_t smpl_joint_values_per_frame =
+          (smpl_indexes.empty() ? num_smpl_joints : smpl_indexes.size()) * 3;
+      if (offset + static_cast<size_t>(num_frames) * smpl_joint_values_per_frame >
+          target_buffer.size()) {
+        std::cerr << "✗ Error: SMPL joint observation needs "
+                  << (offset + static_cast<size_t>(num_frames) * smpl_joint_values_per_frame)
+                  << " values but the encoder buffer holds " << target_buffer.size()
+                  << std::endl;
+        return false;
       }
       saved_frame_for_observation_window_ = std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1);
       
@@ -1133,6 +1247,19 @@ class G1Deploy {
                     << "] in GatherMotionSmplPosesMultiFrame" << std::endl;
           return false;
         }
+      }
+      // Same unchecked-operator[] hazard as the SMPL joint gather above: the
+      // stride is the runtime pose count, the slot width is fixed by the
+      // registry (smpl_pose_10frame_step1 = 630 = 21*3*10).
+      const size_t smpl_pose_values_per_frame =
+          (pose_indexes.empty() ? num_smpl_poses : pose_indexes.size()) * 3;
+      if (offset + static_cast<size_t>(num_frames) * smpl_pose_values_per_frame >
+          target_buffer.size()) {
+        std::cerr << "✗ Error: SMPL pose observation needs "
+                  << (offset + static_cast<size_t>(num_frames) * smpl_pose_values_per_frame)
+                  << " values but the encoder buffer holds " << target_buffer.size()
+                  << std::endl;
+        return false;
       }
       saved_frame_for_observation_window_ = std::max(saved_frame_for_observation_window_, (num_frames - 1) * step_size + 1);
       
@@ -2670,6 +2797,12 @@ class G1Deploy {
         throw;  // Re-throw to stop program initialization
       }
 
+      // Resolve the declared stream kind before any interface exists, so an
+      // invalid SONIC_EXPECTED_STREAM_MODE aborts here rather than after DDS
+      // and the control threads are up.  Validated against the same loaded
+      // config as the forced initial mode.
+      expected_stream_mode_ = ResolveExpectedStreamMode(encoder_config_.encoder_modes);
+
       // Initialize input interface based on type
       if (input_type == "gamepad") {
         input_interface_ = std::make_unique<unitree::common::Gamepad>();
@@ -2700,14 +2833,22 @@ class G1Deploy {
         std::cout << "  Initial encoder mode: " << initial_encoder_mode_ << std::endl;
       }
       else if (input_type == "zmq") {
-        input_interface_ = std::make_unique<ZMQEndpointInterface>(
+        auto zmq_endpoint = std::make_unique<ZMQEndpointInterface>(
           zmq_host, zmq_port, zmq_topic, zmq_conflate, zmq_verbose
         );
+        // The declared kind guards the STREAM, which is the only place the
+        // encoder mode is chosen by someone other than this process.
+        zmq_endpoint->SetExpectedStreamMode(expected_stream_mode_);
+        input_interface_ = std::move(zmq_endpoint);
         std::cout << "Initialized ZMQ endpoint interface" << std::endl;
         std::cout << "  Host: " << zmq_host << ":" << zmq_port << std::endl;
         std::cout << "  Topic: " << zmq_topic << std::endl;
         std::cout << "  Conflate: " << (zmq_conflate ? "enabled" : "disabled") << std::endl;
         std::cout << "  Initial encoder mode: " << initial_encoder_mode_ << std::endl;
+        std::cout << "  Expected stream encoder mode: "
+                  << (expected_stream_mode_ >= 0 ? std::to_string(expected_stream_mode_)
+                                                 : std::string("any (not declared)"))
+                  << std::endl;
       }
       else if (input_type == "zmq_manager") {
         input_interface_ = std::make_unique<ZMQManager>(
@@ -2733,6 +2874,21 @@ class G1Deploy {
         input_interface_ = std::make_unique<SimpleKeyboard>();
         std::cout << "Initialized keyboard input interface (default)" << std::endl;
         std::cout << "  Initial encoder mode: " << initial_encoder_mode_ << std::endl;
+      }
+
+      // A declared stream mode that nothing enforces is worse than no
+      // declaration at all: in a launcher, and in a run transcript, it reads
+      // exactly like a guarded run.  Only the standalone ZMQ endpoint applies
+      // it -- InterfaceManager and ZMQManager own their endpoints privately --
+      // so refuse any other input type here rather than start unguarded.  This
+      // is still before the control threads exist and before any motor command
+      // has been written.
+      if (expected_stream_mode_ >= 0 &&
+          dynamic_cast<ZMQEndpointInterface*>(input_interface_.get()) == nullptr) {
+        std::cerr << "Error: SONIC_EXPECTED_STREAM_MODE is only enforced with "
+                     "--input-type zmq, but this run uses --input-type "
+                  << input_type << std::endl;
+        std::exit(1);
       }
 
       // Set initial VR 3-point compliance values for all input interfaces
@@ -2906,8 +3062,32 @@ class G1Deploy {
     }
 
     /// Gracefully stop all threads and send a damping-only command.
+    ///
+    /// The ORDER here is the safety property, and it is not the obvious one.
+    ///
+    /// Two races have to be closed.  First, Control() runs at 50 Hz and may be
+    /// mid-tick when Stop() is called; that tick ends by writing a full-gain
+    /// policy command into motor_command_buffer_, which would overwrite a
+    /// damping command written before it lands.  operator_state.stop makes
+    /// every subsequent Control() tick return immediately at its first line,
+    /// so waiting one control period plus margin (50 ms > 20 ms) bounds the
+    /// in-flight tick and nothing can overwrite damping afterwards.
+    ///
+    /// Second, LowCmd goes out over best-effort UDP DDS, where a single
+    /// datagram can simply be lost.  So damping must be published MANY times,
+    /// which means the 500 Hz LowCommandWriter thread has to still be running
+    /// when it is written: joining the threads first (as this used to do) left
+    /// exactly one damping datagram, from the direct call at the end.  Writing
+    /// damping into the buffer and then holding for 250 ms lets the writer
+    /// republish it ~125 times before anything is joined.
     void Stop() {
       operator_state.stop = true;
+
+      // Bound the in-flight Control() tick, then damp with the 500 Hz writer
+      // thread still alive so the command is republished, not sent once.
+      std::this_thread::sleep_for(std::chrono::milliseconds(50));
+      CreateDampingCommand();
+      std::this_thread::sleep_for(std::chrono::milliseconds(250));
 
       if (control_thread_ptr_) {
         input_thread_ptr_->Wait();
@@ -2921,6 +3101,9 @@ class G1Deploy {
           planner_thread_ptr_.reset();
         }
       }
+      // Belt: every thread is joined now, so this direct publish is the last
+      // LowCmd on the wire even if the writer thread was descheduled for the
+      // whole window above.
       CreateDampingCommand();
       LowCommandWriter();
       // Damping has already reached LowCmd, so diagnostics allocation/copying
@@ -3770,6 +3953,19 @@ class G1Deploy {
                                       reinitialize_heading_, heading_state_buffer_, has_planner, planner_state, movement_state_buffer_, current_motion_mutex_, report_temperature_);
       }
 
+      // Entering ZMQ streaming retires whatever encoder mode the pre-streaming
+      // window ran: from here the mode belongs to the publisher's protocol
+      // version, and a supervisor gating an SMPL episode needs to SEE the
+      // controller state it after the stream starts.  The "[Mode Filter]
+      // Switched to mode ..." line only prints when the mode differs from the
+      // last one logged, so without this reset a run whose pre-stream window
+      // already ran the same mode would stream correctly and attest nothing.
+      if (auto zmq_endpoint = dynamic_cast<ZMQEndpointInterface*>(input_interface_.get())) {
+        if (zmq_endpoint->ConsumeStreamEnabled()) {
+          last_logged_encoder_mode_.store(kEncoderModeNeverLogged);
+        }
+      }
+
       if (playback_input_file_ && program_state_ == ProgramState::CONTROL) {
         std::string line;
         PlannerState ps{false, false};
@@ -4390,6 +4586,83 @@ class G1Deploy {
     }
 };
 
+namespace {
+
+// Prints the full option list.  Shared by the "not enough positional
+// arguments" path and by the unknown-option rejection in the parse loop, so an
+// operator who mistypes a safety flag is shown the flags that do exist.
+void PrintUsage(const char* program) {
+  std::cout << "Usage: " << program << " <network_interface> <policy_file> <motion_data_path> [OPTIONS]"
+            << std::endl;
+  std::cout << "  network_interface: network interface for DDS communication" << std::endl;
+  std::cout << "  policy_file: path to ONNX policy file" << std::endl;
+  std::cout << "  motion_data_path: path to motion data directory (e.g., reference/bones_072925_test/)" << std::endl;
+  std::cout << "\nOptions:" << std::endl;
+  std::cout << "  --planner-file <path>: specify planner file (optional)" << std::endl;
+  std::cout << "  --input-type <keyboard|gamepad|gamepad_manager|manager|zmq|zmq_manager";
+#if HAS_ROS2
+  std::cout << "|ros2";
+#endif
+  std::cout << ">: input interface type (default: keyboard)" << std::endl;
+  std::cout << "  --output-type <zmq|all";
+#if HAS_ROS2
+  std::cout << "|ros2";
+#endif
+  std::cout << ">: output interface type (default: zmq, 'all' creates all available)" << std::endl;
+  std::cout << "  --target-motion-logfile <path>: write target motion to a csv file if provided" << std::endl;
+  std::cout << "  --planner-motion-logfile <path>: write planner motion to a csv file if provided" << std::endl;
+  std::cout << "  --policy-input-logfile <path>: write policy input tensors to a csv file if provided" << std::endl;
+  std::cout << "  --disable-crc-check: disable CRC validation for MuJoCo simulation" << std::endl;
+  std::cout << "  --enable-command-q-clamp: clamp policy q targets to hard G1 joint limits (default: disabled)" << std::endl;
+  std::cout << "  --command-max-delta-rad <rad>: limit each q target change per 50 Hz control tick (default: disabled)" << std::endl;
+  std::cout << "  --obs-config <path>: specify observation configuration YAML file" << std::endl;
+  std::cout << "  --print-capabilities: with --obs-config, print the SONIC_CAPABILITIES_V1 line and exit (no robot/GPU needed)" << std::endl;
+  std::cout << "  --encoder-file <path>: specify encoder ONNX file (optional)" << std::endl;
+  std::cout << "  --planner-precision <16|32>: specify precision to run the planner model at (default: 16)" << std::endl;
+  std::cout << "  --policy-precision <16|32>: specify precision to run the policy model at (default: 32)" << std::endl;
+  std::cout << "  --zmq-host <host>: ZMQ server host (default: localhost)" << std::endl;
+  std::cout << "  --zmq-port <port>: ZMQ server port (default: 5556)" << std::endl;
+  std::cout << "  --zmq-topic <topic>: ZMQ topic/prefix (default: pose)" << std::endl;
+  std::cout << "  --zmq-conflate: enable ZMQ CONFLATE (default: disabled)" << std::endl;
+  std::cout << "  --zmq-verbose: enable ZMQ subscriber verbose logs" << std::endl;
+  std::cout << "  --zmq-out-port <port>: ZMQ port for output (default: 5557)" << std::endl;
+  std::cout << "  --zmq-out-topic <topic>: ZMQ topic/prefix for output (default: g1_debug)" << std::endl;
+  std::cout << "  --logs-dir <path>: optional logs output base directory (default: logs/<timestamp>/)" << std::endl;
+  std::cout << "  --enable-csv-logs: enable writing CSV logs (default: OFF)" << std::endl;
+  std::cout << "  --enable-motion-recording: enable motion recording for ZMQ/planner (default: OFF)" << std::endl;
+  std::cout << "  --set-compliance <value>: set initial VR 3-point compliance (0.01=rigid, 0.5=compliant; default: [0.5, 0.5, 0.0])" << std::endl;
+  std::cout << "                                 Can specify 1 value (both hands) or 3 values (left_wrist,right_wrist,head)" << std::endl;
+  std::cout << "                                 Keyboard controls: g/h = left hand +/- 0.1, b/v = right hand +/- 0.1" << std::endl;
+  std::cout << "  --max-close-ratio <value>: set initial hand max close ratio (0.2-1.0; default: 1.0 = full closure)" << std::endl;
+  std::cout << "                             0.2 = limited (80% open), 1.0 = full closure allowed" << std::endl;
+  std::cout << "                             Keyboard controls: x/c = +/- 0.1 (always available)" << std::endl;
+  std::cout << "\nEnvironment:" << std::endl;
+  std::cout << "  SONIC_FORCE_ENCODE_MODE=<id>: force the initial encoder mode of the PRE-LOADED" << std::endl;
+  std::cout << "                                reference motions (<motion_data_path>).  Those are" << std::endl;
+  std::cout << "                                robot bundles, so forcing an SMPL mode here makes" << std::endl;
+  std::cout << "                                the first gather fail; leave it at 0 for streaming." << std::endl;
+  std::cout << "  SONIC_EXPECTED_STREAM_MODE=<id>: require every streamed window to map to this" << std::endl;
+  std::cout << "                                encoder mode (pose protocol v1 -> 0, v2/v3 -> 2)." << std::endl;
+  std::cout << "                                Windows that disagree are dropped before they can" << std::endl;
+  std::cout << "                                replace the current motion, and STREAM_MODE_REFUSED" << std::endl;
+  std::cout << "                                is printed (at most once per second).  Unset means" << std::endl;
+  std::cout << "                                the publisher alone decides the mode." << std::endl;
+  std::cout << "  Both are parsed strictly: an unparseable id, or one the loaded observation" << std::endl;
+  std::cout << "  config does not declare, prints '<name> invalid: <value>' and exits 1." << std::endl;
+  std::cout << "\nExamples:" << std::endl;
+  std::cout << "  " << program << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --planner-file policy/planner.onnx --obs-config policy/single_frame/observation_config.yaml --disable-crc-check" << std::endl;
+  std::cout << "  " << program << " enp5s0 policy/token/model.onnx reference/bones_072925_test/ --obs-config policy/token/observation_config.yaml --encoder-file policy/token/encoder.onnx" << std::endl;
+  std::cout << "  " << program << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type gamepad --planner-file policy/planner.onnx" << std::endl;
+  std::cout << "  " << program << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type gamepad_manager --planner-file policy/planner.onnx --zmq-host localhost --zmq-port 5556" << std::endl;
+  std::cout << "  " << program << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type zmq --zmq-host 192.168.1.2 --zmq-port 5556 --zmq-topic pose --zmq-conflate" << std::endl;
+  std::cout << "  " << program << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type zmq_manager --planner-file policy/planner.onnx --zmq-host localhost --zmq-port 5556" << std::endl;
+#if HAS_ROS2
+  std::cout << "  " << program << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type ros2 --planner-file policy/planner.onnx" << std::endl;
+#endif
+}
+
+}  // namespace
+
 /**
  * @brief Entry point: parse CLI arguments and run the G1 deployment application.
  *
@@ -4447,6 +4720,12 @@ int main(int argc, char const* argv[]) {
       // caught by the preflight instead of at robot startup.
       const int capabilities_initial_mode =
           ResolveInitialEncodeMode(0, capabilities_config.encoder.encoder_modes);
+      // Same for the declared stream mode.  It is not part of the capability
+      // line -- CONTRACT-1 is byte-stable and describes the BINARY, not this
+      // run's expectations -- but resolving it here means a launcher that
+      // preflights with the same environment finds an invalid value now
+      // instead of at robot startup.
+      ResolveExpectedStreamMode(capabilities_config.encoder.encoder_modes);
       std::cout << BuildSonicCapabilityLine(capabilities_config.encoder.encoder_modes,
                                             capabilities_initial_mode)
                 << std::endl;
@@ -4455,60 +4734,7 @@ int main(int argc, char const* argv[]) {
   }
 
   if (argc < 4) {
-    std::cout << "Usage: " << argv[0] << " <network_interface> <policy_file> <motion_data_path> [OPTIONS]"
-              << std::endl;
-    std::cout << "  network_interface: network interface for DDS communication" << std::endl;
-    std::cout << "  policy_file: path to ONNX policy file" << std::endl;
-    std::cout << "  motion_data_path: path to motion data directory (e.g., reference/bones_072925_test/)" << std::endl;
-    std::cout << "\nOptions:" << std::endl;
-    std::cout << "  --planner-file <path>: specify planner file (optional)" << std::endl;
-    std::cout << "  --input-type <keyboard|gamepad|gamepad_manager|manager|zmq|zmq_manager";
-#if HAS_ROS2
-    std::cout << "|ros2";
-#endif
-    std::cout << ">: input interface type (default: keyboard)" << std::endl;
-    std::cout << "  --output-type <zmq|all";
-#if HAS_ROS2
-    std::cout << "|ros2";
-#endif
-    std::cout << ">: output interface type (default: zmq, 'all' creates all available)" << std::endl;
-    std::cout << "  --target-motion-logfile <path>: write target motion to a csv file if provided" << std::endl;
-    std::cout << "  --planner-motion-logfile <path>: write planner motion to a csv file if provided" << std::endl;
-    std::cout << "  --policy-input-logfile <path>: write policy input tensors to a csv file if provided" << std::endl;
-    std::cout << "  --disable-crc-check: disable CRC validation for MuJoCo simulation" << std::endl;
-    std::cout << "  --enable-command-q-clamp: clamp policy q targets to hard G1 joint limits (default: disabled)" << std::endl;
-    std::cout << "  --command-max-delta-rad <rad>: limit each q target change per 50 Hz control tick (default: disabled)" << std::endl;
-    std::cout << "  --obs-config <path>: specify observation configuration YAML file" << std::endl;
-    std::cout << "  --print-capabilities: with --obs-config, print the SONIC_CAPABILITIES_V1 line and exit (no robot/GPU needed)" << std::endl;
-    std::cout << "  --encoder-file <path>: specify encoder ONNX file (optional)" << std::endl;
-    std::cout << "  --planner-precision <16|32>: specify precision to run the planner model at (default: 16)" << std::endl;
-    std::cout << "  --policy-precision <16|32>: specify precision to run the policy model at (default: 32)" << std::endl;
-    std::cout << "  --zmq-host <host>: ZMQ server host (default: localhost)" << std::endl;
-    std::cout << "  --zmq-port <port>: ZMQ server port (default: 5556)" << std::endl;
-    std::cout << "  --zmq-topic <topic>: ZMQ topic/prefix (default: pose)" << std::endl;
-    std::cout << "  --zmq-conflate: enable ZMQ CONFLATE (default: disabled)" << std::endl;
-    std::cout << "  --zmq-verbose: enable ZMQ subscriber verbose logs" << std::endl;
-    std::cout << "  --zmq-out-port <port>: ZMQ port for output (default: 5557)" << std::endl;
-    std::cout << "  --zmq-out-topic <topic>: ZMQ topic/prefix for output (default: g1_debug)" << std::endl;
-    std::cout << "  --logs-dir <path>: optional logs output base directory (default: logs/<timestamp>/)" << std::endl;
-    std::cout << "  --enable-csv-logs: enable writing CSV logs (default: OFF)" << std::endl;
-    std::cout << "  --enable-motion-recording: enable motion recording for ZMQ/planner (default: OFF)" << std::endl;
-    std::cout << "  --set-compliance <value>: set initial VR 3-point compliance (0.01=rigid, 0.5=compliant; default: [0.5, 0.5, 0.0])" << std::endl;
-    std::cout << "                                 Can specify 1 value (both hands) or 3 values (left_wrist,right_wrist,head)" << std::endl;
-    std::cout << "                                 Keyboard controls: g/h = left hand +/- 0.1, b/v = right hand +/- 0.1" << std::endl;
-    std::cout << "  --max-close-ratio <value>: set initial hand max close ratio (0.2-1.0; default: 1.0 = full closure)" << std::endl;
-    std::cout << "                             0.2 = limited (80% open), 1.0 = full closure allowed" << std::endl;
-    std::cout << "                             Keyboard controls: x/c = +/- 0.1 (always available)" << std::endl;
-    std::cout << "\nExamples:" << std::endl;
-    std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --planner-file policy/planner.onnx --obs-config policy/single_frame/observation_config.yaml --disable-crc-check" << std::endl;
-    std::cout << "  " << argv[0] << " enp5s0 policy/token/model.onnx reference/bones_072925_test/ --obs-config policy/token/observation_config.yaml --encoder-file policy/token/encoder.onnx" << std::endl;
-    std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type gamepad --planner-file policy/planner.onnx" << std::endl;
-    std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type gamepad_manager --planner-file policy/planner.onnx --zmq-host localhost --zmq-port 5556" << std::endl;
-    std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type zmq --zmq-host 192.168.1.2 --zmq-port 5556 --zmq-topic pose --zmq-conflate" << std::endl;
-    std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type zmq_manager --planner-file policy/planner.onnx --zmq-host localhost --zmq-port 5556" << std::endl;
-#if HAS_ROS2
-    std::cout << "  " << argv[0] << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type ros2 --planner-file policy/planner.onnx" << std::endl;
-#endif
+    PrintUsage(argv[0]);
     exit(0);
   }
   std::cout << "[DEBUG] Arguments validated..." << std::endl;
@@ -4798,6 +5024,43 @@ int main(int argc, char const* argv[]) {
         std::cerr << "Error: --max-close-ratio requires a value argument" << std::endl;
         exit(1);
       }
+    } else if (std::string(argv[i]) == "--print-capabilities") {
+      // Already handled above, ahead of every constructor; accepted here only
+      // so it is not reported as unknown when combined with other flags.
+      continue;
+    } else {
+      // Upstream's parse loop ended without an else, so ANY unrecognised token
+      // was silently ignored -- including a mistyped safety flag.  A run
+      // launched with "--enable-command-q-clamps" (or with a flag this build
+      // predates) came up looking exactly like a run with the clamp on, which
+      // is the worst possible failure mode for an opt-in safety option.
+      std::cerr << "Error: unknown option: " << argv[i] << std::endl;
+      PrintUsage(argv[0]);
+      exit(1);
+    }
+  }
+
+  // Install the shutdown handlers BEFORE the controller exists, so a signal
+  // that arrives during construction (TensorRT engine builds take minutes) is
+  // still latched and honoured by the wait loop below.  Without them SIGINT
+  // and SIGTERM kill the process outright: Stop() never runs, so no damping
+  // command is ever published and the robot holds its last full-gain policy
+  // target.  `docker stop` sends SIGTERM, which is exactly this path.
+  //
+  // The handler is async-signal-safe by construction: it only stores to a
+  // volatile sig_atomic_t.  No SA_RESTART, because the wait loop deliberately
+  // wants its sleep interrupted.
+  {
+    struct sigaction shutdown_action;
+    std::memset(&shutdown_action, 0, sizeof(shutdown_action));
+    shutdown_action.sa_handler = &HandleShutdownSignal;
+    sigemptyset(&shutdown_action.sa_mask);
+    shutdown_action.sa_flags = 0;
+    if (sigaction(SIGINT, &shutdown_action, nullptr) != 0 ||
+        sigaction(SIGTERM, &shutdown_action, nullptr) != 0) {
+      std::cerr << "Error: cannot install SIGINT/SIGTERM handlers, refusing to start"
+                << std::endl;
+      return 1;
     }
   }
 
@@ -4836,22 +5099,35 @@ int main(int argc, char const* argv[]) {
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   
-  // Main application loop - check both operator_state.stop and ROS2 status if using ROS2
+  // Main application loop - check operator_state.stop, a shutdown signal, and
+  // the ROS2 status if using ROS2.
+  //
+  // The poll used to be sleep(0.02): sleep() takes an unsigned int, so 0.02
+  // truncated to 0 and this loop spun a core flat out for the whole run.
+  // 20 ms of real sleep is the interval that was meant.
+  const auto wait_poll = []() {
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+  };
 #if HAS_ROS2
   if (inputType == "ros2") {
-    while (!custom.operator_state.stop && rclcpp::ok()) { 
-      sleep(0.02); 
+    while (!custom.operator_state.stop && !g_shutdown_requested && rclcpp::ok()) {
+      wait_poll();
     }
     if (!rclcpp::ok()) {
       std::cout << "[INFO] ROS2 shutdown detected (Ctrl+C)" << std::endl;
     }
   } else {
-    while (!custom.operator_state.stop) { sleep(0.02); }
+    while (!custom.operator_state.stop && !g_shutdown_requested) { wait_poll(); }
   }
 #else
-  while (!custom.operator_state.stop) { sleep(0.02); }
+  while (!custom.operator_state.stop && !g_shutdown_requested) { wait_poll(); }
 #endif
-  
+
+  if (g_shutdown_requested) {
+    // Falling through to Stop() is the whole point: it damps the robot.
+    std::cout << "[INFO] Shutdown signal received - damping and stopping" << std::endl;
+  }
+
   std::cout << "[DEBUG] Stopping G1Deploy..." << std::endl;
   custom.Stop();
   std::cout << "[DEBUG] Waiting for cleanup..." << std::endl;

@@ -46,9 +46,16 @@
  *   --command-max-delta-rad  | Optional per-control-tick q target delta limit
  *   --planner-fp16        | Use FP16 for planner TensorRT engine
  *   --policy-fp16         | Use FP16 for policy TensorRT engine
+ *   --print-capabilities  | Print the SONIC_CAPABILITIES_V1 line and exit (no robot/GPU)
  */
 #include <cmath>
 #include <cuda_runtime_api.h>
+#include <cctype>
+#include <cerrno>
+#include <cstdlib>
+#include <limits>
+#include <sstream>
+#include <string>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
@@ -156,6 +163,128 @@ namespace {
 bool IsFiniteCommandValue(double value) noexcept {
   constexpr uint64_t kExponentMask = UINT64_C(0x7ff0000000000000);
   return (std::bit_cast<uint64_t>(value) & kExponentMask) != kExponentMask;
+}
+
+// ===========================================================================
+// SONIC encoder-mode capability attestation and strict override parsing.
+// ===========================================================================
+// The supervisor that launches this binary cannot see which encoder modes the
+// loaded observation config declares, nor which one ends up in effect after
+// the SONIC_FORCE_ENCODE_MODE override.  That matters because an SMPL deploy
+// bundle carries smpl_joint.csv plus 29 DoF of ZEROS in joint_pos/joint_vel:
+// mode 2 (smpl) reads the SMPL channels, while mode 0 (g1) reads the zeros and
+// quietly commands a straight-legged zero pose at 50 Hz.  Tracking an SMPL
+// bundle under mode 0 is therefore a hardware hazard, and the supervisor must
+// be able to prove, before it starts an episode, that this binary really does
+// offer mode 2 and really did start in it.
+//
+// So the controller prints one machine-readable capability line on stdout and
+// refuses any override value it cannot validate against the loaded config.
+
+// Escapes the two characters that would break a double-quoted JSON string.
+// Mode names are read from a YAML file on disk, so they are not trusted to be
+// JSON-clean even though the shipped configs only use plain identifiers.
+std::string JsonEscape(const std::string& value) {
+  std::string escaped;
+  escaped.reserve(value.size());
+  for (const char c : value) {
+    if (c == '"' || c == '\\') {
+      escaped.push_back('\\');
+    }
+    escaped.push_back(c);
+  }
+  return escaped;
+}
+
+// Builds the single-line capability attestation (compact JSON, stable key
+// order) that the supervisor latches on the "SONIC_CAPABILITIES_V1: " prefix.
+//
+// encoder_modes is passed in from the LOADED observation config rather than
+// hardcoded: the whole point of the line is to report what THIS config
+// declares, so a config that dropped mode 2 must be visibly missing it.
+std::string BuildSonicCapabilityLine(const std::vector<EncoderModeConfig>& encoder_modes,
+                                     int initial_encoder_mode) {
+  std::ostringstream line;
+  line << "SONIC_CAPABILITIES_V1: {\"encoder_modes\":[";
+  for (size_t i = 0; i < encoder_modes.size(); ++i) {
+    if (i > 0) {
+      line << ",";
+    }
+    line << "{\"id\":" << encoder_modes[i].mode_id
+         << ",\"name\":\"" << JsonEscape(encoder_modes[i].name) << "\"}";
+  }
+  // The accepted pose-protocol versions are hardcoded because the mapping from
+  // protocol version to encoder mode lives in code, not in config: see the
+  // active_protocol_version_ dispatch in
+  // include/input_interface/zmq_endpoint_interface.hpp (~:1705), where v1 sets
+  // encode mode 0 and v2/v3 both set encode mode 2 on every merged window.
+  line << "],\"pose_protocol_versions\":[1,2,3]"
+       << ",\"force_encode_mode_env\":true"
+       << ",\"initial_encoder_mode\":" << initial_encoder_mode << "}";
+  return line.str();
+}
+
+// Resolves the initial encoder mode, applying the SONIC_FORCE_ENCODE_MODE
+// override if it is set AND valid.
+//
+// The previous implementation used std::atoi, which cannot fail: "smpl", "2x",
+// " " and "" all parse to 0 -- and 0 is exactly the mode that is unsafe for an
+// SMPL bundle, because gathering mode-0 observations off the zero-filled
+// joint_pos SUCCEEDS.  A typo in the launcher would therefore have silently
+// downgraded an intended SMPL run into a zero-pose command stream.  So require
+// the whole string to be consumed by strtol, and require the resulting id to be
+// one of the modes the loaded config actually declares.
+//
+// Failure aborts the process.  This runs during construction, long before DDS,
+// the control threads or any motor command exists, so exiting is the safe
+// outcome: there is no robot state to wind down yet.
+int ResolveInitialEncodeMode(int default_mode,
+                             const std::vector<EncoderModeConfig>& encoder_modes) {
+  const char* forced = std::getenv("SONIC_FORCE_ENCODE_MODE");
+  if (forced == nullptr) {
+    return default_mode;
+  }
+
+  const std::string value(forced);
+  // Single rejection path so every invalid form emits the identical marker.
+  auto reject = [&value]() {
+    std::cout << "SONIC_FORCE_ENCODE_MODE invalid: '" << value << "'" << std::endl;
+    std::exit(1);
+  };
+
+  // strtol treats an empty string as "no digits" and returns 0 with end == begin;
+  // handle it explicitly so the intent is obvious.  strtol also silently skips
+  // leading whitespace, which would let a stray-space value through full
+  // consumption; on a safety gate that is a typo, so reject it too.
+  if (value.empty() || std::isspace(static_cast<unsigned char>(value.front()))) {
+    reject();
+  }
+
+  errno = 0;
+  char* end = nullptr;
+  const long parsed = std::strtol(value.c_str(), &end, 10);
+  // Full consumption: no leading-only digits ("2x"), no trailing whitespace,
+  // no range overflow.  end == value.c_str() means nothing parsed at all.
+  if (errno != 0 || end == value.c_str() || end == nullptr || *end != '\0' ||
+      parsed < static_cast<long>(std::numeric_limits<int>::min()) ||
+      parsed > static_cast<long>(std::numeric_limits<int>::max())) {
+    reject();
+  }
+
+  const int mode_id = static_cast<int>(parsed);
+  // A syntactically valid id that this config does not declare is still a
+  // misconfiguration: it would land in modes_to_try, fail the mode lookup and
+  // fall through to whatever mode does gather -- mode 0 again.
+  const bool declared = std::any_of(
+      encoder_modes.begin(), encoder_modes.end(),
+      [mode_id](const EncoderModeConfig& mode) { return mode.mode_id == mode_id; });
+  if (!declared) {
+    reject();
+  }
+
+  std::cout << "⚠ SONIC_FORCE_ENCODE_MODE=" << mode_id
+            << " — forcing initial encoder mode" << std::endl;
+  return mode_id;
 }
 
 }  // namespace
@@ -2035,16 +2164,49 @@ class G1Deploy {
       
       // Store the intended encoder mode for warning purposes
       int intended_encoder_mode = current_motion_->GetEncodeMode();
-      
+
+      // =====================================================================
+      // Fail-closed for encoder mode 2 (smpl): NO fallback.
+      // =====================================================================
+      // Upstream treats a gather failure as "try the other modes until one
+      // works".  That is reasonable when every mode is a different view of the
+      // same retargeted G1 trajectory, but it is precisely the hazard for
+      // SMPL references.  An SMPL deploy bundle carries smpl_joint.csv plus 29
+      // DoF of ZEROS in joint_pos/joint_vel, so the fallback target -- mode 0
+      // (g1) -- does not fail: it gathers those zeros SUCCESSFULLY and then
+      // commands the robot to a straight-legged zero pose at 50 Hz.  The
+      // fallback is the accident, not the failure that triggered it.
+      //
+      // Mode 2 is also never reached by accident.  It is only ever intended by
+      // explicit selection: the SONIC_FORCE_ENCODE_MODE override (validated
+      // against the loaded config, see ResolveInitialEncodeMode) or the ZMQ
+      // pose protocol v2/v3 mapping, which re-applies SetEncodeMode(2) on
+      // every merged window.  So an intended mode 2 that cannot gather means
+      // the reference data contradicts the operator's explicit intent, and
+      // refusing is the only correct answer.
+      //
+      // Returning false is a verified-safe outcome, not a hang: it propagates
+      // out of GatherObservations() (~:4045), the control loop sets
+      // operator_state.stop, main()'s run loop exits, and Stop() publishes
+      // CreateDampingCommand() -- a damping shutdown, not a frozen last
+      // command and not a zero-pose command.
+      const bool refuse_mode_fallback = (intended_encoder_mode == 2);
+
       // Build list of modes to try (start with current mode, then all others as fallback)
       std::vector<int> modes_to_try;
-      
-      if (!encoder_config_.encoder_modes.empty()) {
+
+      if (refuse_mode_fallback) {
+        // Exactly one candidate: the intended mode.  Deliberately built
+        // without consulting encoder_config_.encoder_modes, so that even a
+        // config that somehow failed to declare mode 2 cannot cause a silent
+        // downgrade -- it just fails the gather and stops the robot.
+        modes_to_try.push_back(intended_encoder_mode);
+      } else if (!encoder_config_.encoder_modes.empty()) {
         // Start with intended mode if valid
         if (current_motion_->GetEncodeMode() >= 0) {
           modes_to_try.push_back(current_motion_->GetEncodeMode());
         }
-        
+
         // Add all other modes as fallbacks
         for (const auto& mode_config : encoder_config_.encoder_modes) {
           if (mode_config.mode_id != current_motion_->GetEncodeMode()) {
@@ -2052,7 +2214,7 @@ class G1Deploy {
           }
         }
       }
-      
+
       // If no modes configured, try without mode filter
       if (modes_to_try.empty()) {
         modes_to_try.push_back(-1);  // -1 means no mode filter (all observations required)
@@ -2062,7 +2224,18 @@ class G1Deploy {
       for (size_t attempt = 0; attempt < modes_to_try.size(); ++attempt) {
         int mode_to_try = modes_to_try[attempt];
         current_motion_->SetEncodeMode(mode_to_try);
-        
+
+        // Any attempt past the first is an actual switch away from the mode the
+        // operator (or the pose protocol) asked for.  Emit a machine-readable
+        // stdout marker so the supervisor can fail the run: the observation
+        // set the encoder sees no longer matches the reference the run was
+        // approved against.  Unreachable when refuse_mode_fallback is set,
+        // since modes_to_try then holds a single entry.
+        if (attempt > 0) {
+          std::cout << "ENCODER_MODE_FALLBACK: intended=" << intended_encoder_mode
+                    << " active=" << mode_to_try << std::endl;
+        }
+
         // Determine which observations to gather based on encoder mode
         std::vector<std::string> required_observations;
         bool use_mode_filter = false;
@@ -2145,6 +2318,13 @@ class G1Deploy {
       }
       
       // All modes failed
+      if (refuse_mode_fallback) {
+        // The single intended mode (2 = smpl) failed and, by design, no other
+        // mode was offered.  Marker on stdout so the supervisor can attribute
+        // the damping stop that follows to a refused downgrade rather than to
+        // a crash.
+        std::cout << "ENCODER_MODE_FALLBACK_REFUSED: intended=2" << std::endl;
+      }
       std::cerr << "✗ Error: All available encoder modes failed to gather observations" << std::endl;
       return false;
     }
@@ -2395,12 +2575,21 @@ class G1Deploy {
         is_using_encoder_ = true;
         initial_encoder_mode_ = 0;  // Encoder available, default to mode 0.
         // SONIC_FORCE_ENCODE_MODE overrides the initial mode (e.g. 2 = smpl:
-        // track SMPL joint references directly, no retargeted G1 channels)
-        if (const char* fm = std::getenv("SONIC_FORCE_ENCODE_MODE")) {
-          initial_encoder_mode_ = std::atoi(fm);
-          std::cout << "⚠ SONIC_FORCE_ENCODE_MODE=" << initial_encoder_mode_
-                    << " — forcing initial encoder mode" << std::endl;
-        }
+        // track SMPL joint references directly, no retargeted G1 channels).
+        // Strictly parsed and validated against the modes this config declares;
+        // an unparseable or undeclared value aborts here rather than silently
+        // resolving to mode 0.
+        initial_encoder_mode_ =
+            ResolveInitialEncodeMode(initial_encoder_mode_, encoder_config_.encoder_modes);
+
+        // Attest capabilities exactly once, on stdout, from the modes the
+        // config actually declared and the mode that is now really in effect.
+        // The supervisor latches this line before it will start an SMPL
+        // episode; without it, it has no proof that this binary can track
+        // SMPL references at all.
+        std::cout << BuildSonicCapabilityLine(encoder_config_.encoder_modes,
+                                              initial_encoder_mode_)
+                  << std::endl;
       } else {
         if (encoder_config_.dimension > 0) {
           std::cout << "Encoder config found but no encoder file provided - tokens can be set externally" << std::endl;
@@ -4214,6 +4403,57 @@ class G1Deploy {
  */
 int main(int argc, char const* argv[]) {
   std::cout << "[DEBUG] Program starting..." << std::endl;
+
+  // =========================================================================
+  // --print-capabilities: preflight probe, no robot and no GPU.
+  // =========================================================================
+  // The supervisor needs to know, before it commits an SMPL episode to a real
+  // G1, whether this binary + this observation config actually offer encoder
+  // mode 2 and which mode the environment will start in.  Asking the running
+  // controller is too late (by then DDS is up and the robot is listening), so
+  // this flag answers the question from the observation config alone.
+  //
+  // Handled here, ahead of the positional-argument check and ahead of every
+  // constructor, so it needs no network interface, no policy ONNX, no motion
+  // directory, no DDS, no TensorRT engine and no CUDA device.  The observation
+  // config parser is a self-contained line reader (ObservationConfigParser in
+  // include/observation_config.hpp) with no such dependencies.
+  {
+    bool print_capabilities = false;
+    std::string capabilities_obs_config;
+    for (int i = 1; i < argc; ++i) {
+      const std::string arg = argv[i];
+      if (arg == "--print-capabilities") {
+        print_capabilities = true;
+      } else if (arg == "--obs-config" && i + 1 < argc) {
+        capabilities_obs_config = argv[i + 1];
+      }
+    }
+
+    if (print_capabilities) {
+      // Refuse to guess.  Reporting an empty mode list because no config was
+      // supplied would read, to the supervisor, exactly like a config that
+      // dropped mode 2 -- a silent false negative on a safety gate.
+      if (capabilities_obs_config.empty()) {
+        std::cerr << "Error: --print-capabilities requires --obs-config <path>" << std::endl;
+        return 1;
+      }
+
+      const FullObservationConfig capabilities_config =
+          ObservationConfigParser::ParseFullConfig(capabilities_obs_config);
+      // Apply the same strict override resolution the constructor uses, so the
+      // reported initial_encoder_mode is the mode a run launched with this
+      // environment would really start in -- and so an invalid override is
+      // caught by the preflight instead of at robot startup.
+      const int capabilities_initial_mode =
+          ResolveInitialEncodeMode(0, capabilities_config.encoder.encoder_modes);
+      std::cout << BuildSonicCapabilityLine(capabilities_config.encoder.encoder_modes,
+                                            capabilities_initial_mode)
+                << std::endl;
+      return 0;
+    }
+  }
+
   if (argc < 4) {
     std::cout << "Usage: " << argv[0] << " <network_interface> <policy_file> <motion_data_path> [OPTIONS]"
               << std::endl;
@@ -4239,6 +4479,7 @@ int main(int argc, char const* argv[]) {
     std::cout << "  --enable-command-q-clamp: clamp policy q targets to hard G1 joint limits (default: disabled)" << std::endl;
     std::cout << "  --command-max-delta-rad <rad>: limit each q target change per 50 Hz control tick (default: disabled)" << std::endl;
     std::cout << "  --obs-config <path>: specify observation configuration YAML file" << std::endl;
+    std::cout << "  --print-capabilities: with --obs-config, print the SONIC_CAPABILITIES_V1 line and exit (no robot/GPU needed)" << std::endl;
     std::cout << "  --encoder-file <path>: specify encoder ONNX file (optional)" << std::endl;
     std::cout << "  --planner-precision <16|32>: specify precision to run the planner model at (default: 16)" << std::endl;
     std::cout << "  --policy-precision <16|32>: specify precision to run the policy model at (default: 32)" << std::endl;

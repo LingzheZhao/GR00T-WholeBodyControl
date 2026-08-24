@@ -362,6 +362,37 @@ int ResolveExpectedStreamMode(const std::vector<EncoderModeConfig>& encoder_mode
   return *expected;
 }
 
+// The released policy's hip gains are hardcoded to the 7520_22 actuator basis
+// (STIFFNESS/EFFORT_LIMIT_7520_22 in policy_parameters.hpp, both hip pitch and
+// roll), which is Unitree's mode-11 {22.5,22.5} variant.  Nothing else in this
+// binary verifies the connected robot IS that variant -- LowStateHandler reads
+// mode_machine only to echo it back.  Driving a mode-2/mode-5 G1 (lower-torque
+// hips) with these gains is an effort/stiffness mismatch on the load-bearing
+// hips.  SONIC_EXPECTED_MODE_MACHINE, when set, makes CheckSafety refuse to
+// enter CONTROL until the robot's fresh CRC-valid LowState reports exactly this
+// value.  Unset (sim, MuJoCo) leaves behaviour unchanged.  Strict parse:
+// invalid or out-of-range aborts at startup rather than silently disabling the
+// gate.
+int ResolveExpectedModeMachine() {
+  const char* raw = std::getenv("SONIC_EXPECTED_MODE_MACHINE");
+  if (raw == nullptr) {
+    return -1;  // gate inactive; the real-robot launcher always sets it
+  }
+  errno = 0;
+  char* end = nullptr;
+  const long value = std::strtol(raw, &end, 10);
+  if (end == raw || *end != '\0' || errno != 0 || value < 0 || value > 255) {
+    std::cerr << "SONIC_EXPECTED_MODE_MACHINE invalid: '" << raw << "'"
+              << std::endl;
+    std::exit(1);
+  }
+  std::cout << "SONIC_EXPECTED_MODE_MACHINE=" << value
+            << " — control will not start unless the robot reports this "
+               "mode_machine"
+            << std::endl;
+  return static_cast<int>(value);
+}
+
 }  // namespace
 
 
@@ -400,6 +431,7 @@ class G1Deploy {
     int counter_;          ///< General-purpose tick counter.
     Mode mode_pr_;         ///< Ankle control mode (series PR vs. parallel AB).
     uint8_t mode_machine_; ///< Robot variant code received from LowState.
+    int expected_mode_machine_ = -1;  ///< SONIC_EXPECTED_MODE_MACHINE gate; -1 = off.
     
     // =========================================================================
     // Input interface and buffered input data
@@ -2803,6 +2835,10 @@ class G1Deploy {
       // config as the forced initial mode.
       expected_stream_mode_ = ResolveExpectedStreamMode(encoder_config_.encoder_modes);
 
+      // Resolve the expected robot variant before DDS/threads, so an invalid
+      // value aborts at startup rather than after the controller is live.
+      expected_mode_machine_ = ResolveExpectedModeMachine();
+
       // Initialize input interface based on type
       if (input_type == "gamepad") {
         input_interface_ = std::make_unique<unitree::common::Gamepad>();
@@ -3188,6 +3224,25 @@ class G1Deploy {
       auto now = std::chrono::steady_clock::now();
       if (now - low_state_data.timestamp > LOW_STATE_ABSENT_THRESHOLD) {
         std::cout << "[ERROR] Lost LowState data connection from robot!" << std::endl;
+        return false;
+      }
+
+      // Hardware-variant gate.  ls came through the same CRC check as every
+      // LowState (LowStateHandler drops CRC failures before buffering), so a
+      // reported mode_machine here is authenticated.  Fail closed: refuse to
+      // start or continue unless the robot's variant is exactly the one the
+      // policy's hip actuator basis was built for.  mode_pr is a control choice
+      // this binary owns (hardcoded to Mode::PR and echoed), not a robot
+      // readback, so mode_machine is the only meaningful variant signal.
+      if (expected_mode_machine_ >= 0 &&
+          static_cast<int>(ls->mode_machine()) != expected_mode_machine_) {
+        static int reject_count = 0;
+        if (reject_count++ % 50 == 0) {  // ~once per second at 50 Hz
+          std::cout << "MODE_MACHINE_REJECTED: expected=" << expected_mode_machine_
+                    << " got=" << unsigned(ls->mode_machine())
+                    << " — the released policy targets this variant only; "
+                       "refusing to actuate" << std::endl;
+        }
         return false;
       }
 

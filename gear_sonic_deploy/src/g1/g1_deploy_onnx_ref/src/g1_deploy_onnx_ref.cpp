@@ -2699,12 +2699,28 @@ const uint8_t required_mode_machine_;  ///< Immutable validated command identity
     // CheckMode return code and could spin forever or proceed on stale strings.
     void ReleaseMotionServiceOrThrow() {
       if (required_mode_machine_ == kSimulationModeMachine) {
-        // The isolated MuJoCo simulation has no Unitree motion service:
-        // there is no high-level owner to hand off from, and the CheckMode
-        // RPC can only time out against a service that does not exist.  The
-        // physical path below keeps every RPC failure fatal.
-        std::cout << "[SAFETY] Simulation-only runtime: no MotionSwitcher "
-                     "handoff to perform" << std::endl;
+        // The isolated MuJoCo simulation has no Unitree motion service: there
+        // is no high-level owner to hand off from, and the CheckMode RPC can
+        // only time out against a service that does not exist.  But the
+        // takeover BOUNDARY still has to complete — merely returning here
+        // left the 500 Hz writer's gate shut for the whole process: the
+        // controller computed policy commands it never published, the
+        // simulated robot hung limp on the harness band, and it collapsed
+        // the moment the band dropped.  Reach the exact state the physical
+        // path reaches after its confirmed-empty CheckMode: quiet guard
+        // disarmed, takeover marked, gate opened with the synchronous
+        // damping write, guard reader torn down.
+        lowcmd_quiet_check_active_.store(false, std::memory_order_release);
+        lowcmd_takeover_started_ = true;
+        const bool boundary_write_succeeded = BeginDampingTakeover();
+        lowcmd_guard_subscriber_.reset();
+        if (!boundary_write_succeeded) {
+          throw std::runtime_error(
+              "synchronous boundary damping LowCmd write failed (simulation)");
+        }
+        std::cout << "[SAFETY] Simulation-only runtime: command gate opened "
+                     "at the simulated takeover boundary (no MotionSwitcher "
+                     "handoff to perform)" << std::endl;
         return;
       }
       if (g_shutdown_requested) {

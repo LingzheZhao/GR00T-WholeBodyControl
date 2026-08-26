@@ -382,7 +382,7 @@ CHECKPOINT_ENCODER="${CHECKPOINT}_encoder.onnx"
 # Additional flags for simulation mode
 EXTRA_ARGS=""
 if [[ "$ENV_TYPE" == "sim" ]]; then
-    EXTRA_ARGS="--disable-crc-check"
+    EXTRA_ARGS="--disable-crc-check --simulation-only"
     echo -e "${YELLOW}📋 Simulation mode: CRC check will be disabled${NC}"
     echo ""
 fi

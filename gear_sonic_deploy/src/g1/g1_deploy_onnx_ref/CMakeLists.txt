@@ -172,6 +172,7 @@ else()
 endif()
 
 find_package(Eigen3 REQUIRED)
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 
 set(EXE_INCLUDES
   ${CMAKE_CURRENT_SOURCE_DIR}/include/
@@ -204,7 +205,7 @@ target_include_directories(${EXECUTABLE_NAME} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
 target_link_directories(${EXECUTABLE_NAME} PRIVATE ${CUDA_LINK_DIRS})
 target_link_libraries(
   ${EXECUTABLE_NAME} PRIVATE ${PROJECT_NAME}
-  ${EXE_LIBS}
+  ${EXE_LIBS} OpenSSL::Crypto
 )
 
 # Setting our output directory and C++ standard

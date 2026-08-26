@@ -62,12 +62,14 @@ struct MotionSequence;
 class StreamedMotionMerger {
 public:
     /// Compile-time toggle for debug log output.
-    static constexpr bool DEBUG_LOGGING = true;
+    static constexpr bool DEBUG_LOGGING = false;
     /// Number of already-consumed frames to retain before the playback cursor
     /// (provides look-back for interpolation / blending).
     static constexpr int HISTORY_FRAMES = 5;
     /// Maximum tolerated gap (in current-rate frames) before a catch-up reset.
     static constexpr int MAX_GAP_FRAMES = 200;
+    /// Fixed MotionSequence backing capacity used by the streaming path.
+    static constexpr int MAX_MOTION_FRAMES = 15000;
     
     /// Returned by MergeIncomingData() to communicate what happened.
     struct MergeResult {
@@ -159,6 +161,17 @@ public:
             merge_dst_frame,
             did_catchup
         );
+
+        // Never let an unbounded catch_up=false gap drive the fixed-capacity
+        // MotionSequence writes past their 15,000-row allocation.
+        if (merge_dst_frame < 0 || data.num_frames > MAX_MOTION_FRAMES ||
+            merge_dst_frame > MAX_MOTION_FRAMES - data.num_frames) {
+            std::cerr << "[StreamedMotionMerger] Window exceeds fixed capacity; "
+                         "forcing catch-up reset" << std::endl;
+            new_window_start = incoming_frame_start;
+            merge_dst_frame = 0;
+            did_catchup = true;
+        }
         
         // Create new motion sequence
         auto new_motion = CreateNewMotion(data);
@@ -214,8 +227,30 @@ private:
     // Validate incoming data structure
     bool ValidateIncomingData(const IncomingData& data) const {
         // Check required fields
-        if (data.body_quat.empty() || data.frame_indices.empty()) {
+        if (data.num_frames <= 0 || data.num_frames > MAX_MOTION_FRAMES ||
+            data.body_quat.size() != static_cast<size_t>(data.num_frames) ||
+            data.frame_indices.size() != static_cast<size_t>(data.num_frames)) {
             std::cerr << "[StreamedMotionMerger] Missing required fields (body_quat or frame_indices)" << std::endl;
+            return false;
+        }
+        for (const auto& quaternions : data.body_quat) {
+            if (quaternions.size() !=
+                static_cast<size_t>(data.num_quat_bodies)) return false;
+        }
+        const auto validate_rows = [frames = data.num_frames](
+            const auto& rows, int width) {
+            if (rows.empty()) return true;
+            if (rows.size() != static_cast<size_t>(frames) || width <= 0) return false;
+            return std::all_of(rows.begin(), rows.end(), [width](const auto& row) {
+                return row.size() == static_cast<size_t>(width);
+            });
+        };
+        if (!validate_rows(data.joint_pos, data.num_joints) ||
+            !validate_rows(data.joint_vel, data.num_joints) ||
+            !validate_rows(data.smpl_joints, data.num_smpl_joints) ||
+            !validate_rows(data.smpl_pose, data.num_smpl_poses)) {
+            std::cerr << "[StreamedMotionMerger] Row dimensions do not match metadata"
+                      << std::endl;
             return false;
         }
         
@@ -356,7 +391,7 @@ private:
         int smpl_poses_to_reserve = data.num_smpl_poses;
         
         new_motion->ReserveCapacity(
-            15000,
+            MAX_MOTION_FRAMES,
             joints_to_reserve,
             bodies_to_reserve,
             body_quaternions_to_reserve,
@@ -514,4 +549,3 @@ private:
 };
 
 #endif // STREAMED_MOTION_MERGER_HPP
-

@@ -19,7 +19,7 @@ static void run_local_publisher(const std::string &bind_endpoint,
                                 int interval_ms,
                                 bool ramp_prefix)
 {
-  constexpr size_t HEADER_SIZE = 1024;
+  constexpr size_t HEADER_SIZE = ZMQPackedMessageSubscriber::HEADER_SIZE;
   
   try {
     zmq::context_t ctx(1);
@@ -56,7 +56,7 @@ static void run_local_publisher(const std::string &bind_endpoint,
         fake_positions[j] = static_cast<float>(i) + static_cast<float>(j) * 0.1f;
       }
 
-      // Pack into single frame: [topic_prefix][1024-byte JSON header][fields...]
+      // Pack into one frame: [topic_prefix][fixed-size JSON header][fields...]
       const size_t packed_size = topic.size() + HEADER_SIZE + sizeof(idx) + sizeof(ts_ns) 
                                   + fake_positions.size() * sizeof(float);
       std::vector<unsigned char> packed_data(packed_size, 0);
@@ -154,7 +154,11 @@ int main(int argc, char** argv)
       }
     });
   std::cout << "[Test] Starting subscriber..." << std::endl;
-  sub.Start();
+  if (!sub.Start()) {
+    std::cerr << "[Test] Subscriber failed to start" << std::endl;
+    if (pub_thread.joinable()) pub_thread.join();
+    return 1;
+  }
   std::cout << "[Test] Subscriber started, waiting 2s..." << std::endl;
 
   // Let it run for a while
@@ -167,8 +171,10 @@ int main(int argc, char** argv)
   // Print results
   std::cout << "\n========== TEST RESULTS ==========" << std::endl;
   std::cout << "Mode: " << (use_conflate ? "CONFLATE" : "NO-CONFLATE") << std::endl;
-  if (received_indices.empty()) {
-    std::cout << "No messages received" << std::endl;
+  const bool subscriber_failed = sub.HasFailed();
+  const bool received_any = !received_indices.empty();
+  if (!received_any) {
+    std::cerr << "No messages received" << std::endl;
   } else {
     std::cout << "First index: " << received_indices.front() << std::endl;
     std::cout << "Last index: " << received_indices.back() << std::endl;
@@ -192,5 +198,5 @@ int main(int argc, char** argv)
   std::cout << "==================================" << std::endl;
 
   std::cout << "[Test] Done." << std::endl;
-  return 0;
+  return (received_any && !subscriber_failed) ? 0 : 1;
 }

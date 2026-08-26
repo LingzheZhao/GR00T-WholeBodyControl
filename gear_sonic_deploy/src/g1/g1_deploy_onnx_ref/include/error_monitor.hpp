@@ -19,6 +19,7 @@
 #pragma once
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <iostream>
 
@@ -56,12 +57,16 @@ class ErrorMonitor {
           std::cout << "[ErrorMonitor] Motor " << i << " (" << jointName(i)
                     << ") FAULT: code 0x" << std::hex << state << std::dec
                     << std::endl;
-          error_count_++;
+          error_count_.fetch_add(1, std::memory_order_relaxed);
         } else if (state == 0 && prev_motorstate_[i] != 0) {
           // Fault cleared
           std::cout << "[ErrorMonitor] Motor " << i << " (" << jointName(i)
                     << ") fault CLEARED" << std::endl;
-          if (error_count_ > 0) error_count_--;
+          int count = error_count_.load(std::memory_order_relaxed);
+          while (count > 0 &&
+                 !error_count_.compare_exchange_weak(
+                     count, count - 1, std::memory_order_relaxed)) {
+          }
         } else {
           // Fault code changed
           std::cout << "[ErrorMonitor] Motor " << i << " (" << jointName(i)
@@ -74,11 +79,12 @@ class ErrorMonitor {
     }
 
     // Periodic reminder while faults persist
-    if (error_count_ > 0) {
+    const int error_count = error_count_.load(std::memory_order_relaxed);
+    if (error_count > 0) {
       reminder_counter_++;
       if (reminder_counter_ >= reminder_interval_) {
         reminder_counter_ = 0;
-        std::cout << "[ErrorMonitor] " << error_count_
+        std::cout << "[ErrorMonitor] " << error_count
                   << " motor(s) still faulted:";
         for (int i = 0; i < G1_NUM_MOTOR; ++i) {
           if (prev_motorstate_[i] != 0) {
@@ -92,14 +98,17 @@ class ErrorMonitor {
   }
 
   /// Number of motors currently in a faulted state.
-  int getErrorCount() const { return error_count_; }
+  int getErrorCount() const { return error_count_.load(std::memory_order_relaxed); }
 
   /// True if any motor is currently faulted.
-  bool hasErrors() const { return error_count_ > 0; }
+  bool hasErrors() const { return getErrorCount() > 0; }
 
  private:
   std::array<uint32_t, G1_NUM_MOTOR> prev_motorstate_;
-  int error_count_ = 0;
+  // update() runs in the DDS callback while CheckSafety()/audio read this from
+  // the control thread.  Only the count crosses threads; the per-motor array
+  // remains callback-owned.
+  std::atomic<int> error_count_{0};
   int reminder_interval_ = 2500;
   int reminder_counter_ = 0;
 

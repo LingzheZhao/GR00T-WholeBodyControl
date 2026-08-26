@@ -52,6 +52,9 @@
 #include <string>
 #include <thread>
 #include <functional>
+#include <limits>
+#include <optional>
+#include <unordered_set>
 #include <vector>
 #include <algorithm>
 
@@ -97,6 +100,13 @@ class ZMQPackedMessageSubscriber {
   public:
     /// Fixed size (in bytes) of the JSON header block at the start of each packed message.
     static constexpr size_t HEADER_SIZE = 1280;
+    // The largest accepted real pose window is under 2 MiB (512 frames with
+    // every supported motion field at f64).  Leave generous headroom without
+    // permitting a pose publisher to force a 64 MiB callback copy/allocation.
+    static constexpr size_t MAX_PAYLOAD_SIZE = 8U * 1024U * 1024U;
+    static constexpr size_t MAX_FIELDS = 64;
+    static constexpr size_t MAX_FIELD_RANK = 4;
+    static constexpr size_t MAX_DIMENSION = 15000;
 
     /**
      * @brief Construct a subscriber (does NOT connect or start yet).
@@ -142,20 +152,33 @@ class ZMQPackedMessageSubscriber {
       bool optional = false;         ///< Whether the field may be absent from the payload.
       
       /// @brief Return the byte size of a single element for this dtype.
-      size_t GetElementSize() const {
+      std::optional<size_t> GetElementSize() const {
         if (dtype == "f64" || dtype == "i64") return 8;
         if (dtype == "f32" || dtype == "i32") return 4;
         if (dtype == "i16" || dtype == "f16") return 2;
         if (dtype == "i8" || dtype == "u8" || dtype == "bool") return 1;
-        return 4; // default
+        return std::nullopt;
       }
       
-      // Compute total byte size for this field
-      size_t ComputeByteSize() const {
-        if (shape.empty()) return 0;
+      // Compute total byte size with checked multiplication.  Header shapes
+      // are untrusted network input; wraparound here used to defeat the later
+      // payload-bounds check.
+      std::optional<size_t> ComputeByteSize() const {
+        const auto element_size = GetElementSize();
+        if (!element_size || shape.empty()) return std::nullopt;
         size_t total_elements = 1;
-        for (auto dim : shape) total_elements *= dim;
-        return total_elements * GetElementSize();
+        for (const auto dim : shape) {
+          if (dim == 0 ||
+              total_elements > std::numeric_limits<size_t>::max() / dim) {
+            return std::nullopt;
+          }
+          total_elements *= dim;
+        }
+        if (total_elements >
+            std::numeric_limits<size_t>::max() / *element_size) {
+          return std::nullopt;
+        }
+        return total_elements * *element_size;
       }
     };
 
@@ -163,6 +186,7 @@ class ZMQPackedMessageSubscriber {
     struct DecodedHeader {
       int version = 0;               ///< Protocol version (e.g. 1, 2, 3).
       std::string endian;            ///< "le" or "be" (empty defaults to "le").
+      std::string profile;           ///< Publisher-declared joint/schema profile.
       int count = -1;                ///< Optional frame/element count hint.
       std::vector<FieldInfo> fields; ///< Ordered list of binary field descriptors.
       
@@ -217,29 +241,39 @@ class ZMQPackedMessageSubscriber {
     }
 
     /// Spawn the background receive thread.  Requires a callback and a connection.
-    void Start() {
+    bool Start() {
       if (running_) {
         std::cerr << "[ZMQPackedMessageSubscriber] Already running" << std::endl;
-        return;
+        return true;
       }
       if (!on_decoded_) {
         std::cerr << "[ZMQPackedMessageSubscriber] Error: callback not set" << std::endl;
-        return;
+        return false;
       }
+      failed_.store(false, std::memory_order_release);
       if (!Connect()) {
         std::cerr << "[ZMQPackedMessageSubscriber] Error: Connect() failed" << std::endl;
-        return;
+        return false;
       }
       running_ = true;
-      recv_thread_ = std::thread([this]() { this->RunLoop(); });
+      try {
+        recv_thread_ = std::thread([this]() { this->RunLoop(); });
+      } catch (...) {
+        running_ = false;
+        if (socket_) {
+          try { socket_->close(); } catch (...) {}
+          socket_.reset();
+        }
+        return false;
+      }
       if (verbose_) {
         std::cout << "[ZMQPackedMessageSubscriber] Background thread started" << std::endl;
       }
+      return true;
     }
 
     /// Stop the background thread and close the socket.
     void Stop() {
-      if (!running_) return;
       running_ = false;
       if (recv_thread_.joinable()) {
         recv_thread_.join();
@@ -248,6 +282,10 @@ class ZMQPackedMessageSubscriber {
         try { socket_->close(); } catch (...) {}
         socket_.reset();
       }
+    }
+
+    bool HasFailed() const noexcept {
+      return failed_.load(std::memory_order_acquire);
     }
 
     /**
@@ -277,6 +315,14 @@ class ZMQPackedMessageSubscriber {
           }
           packed_data += topic_.size();
           packed_size -= topic_.size();
+        }
+
+        if (packed_size > HEADER_SIZE + MAX_PAYLOAD_SIZE) {
+          if (verbose_) {
+            std::cerr << "[ZMQPackedMessageSubscriber] Packed frame exceeds "
+                      << MAX_PAYLOAD_SIZE << "-byte payload limit" << std::endl;
+          }
+          return false;
         }
 
         if (packed_size < HEADER_SIZE) {
@@ -317,7 +363,11 @@ class ZMQPackedMessageSubscriber {
               std::cout << f.shape[j];
               if (j < f.shape.size() - 1) std::cout << ",";
             }
-            std::cout << "] bytes=" << f.ComputeByteSize() << std::endl;
+            const auto field_bytes = f.ComputeByteSize();
+            std::cout << "] bytes="
+                      << (field_bytes ? std::to_string(*field_bytes)
+                                      : std::string("invalid"))
+                      << std::endl;
           }
         }
         
@@ -333,8 +383,16 @@ class ZMQPackedMessageSubscriber {
         
         size_t offset = 0;
         for (const auto& field : decoded.fields) {
-          size_t field_bytes = field.ComputeByteSize();
-          if (offset + field_bytes > data_size) {
+          const auto maybe_field_bytes = field.ComputeByteSize();
+          if (!maybe_field_bytes) {
+            if (verbose_) {
+              std::cerr << "[ZMQPackedMessageSubscriber] Invalid field size for "
+                        << field.name << std::endl;
+            }
+            return false;
+          }
+          const size_t field_bytes = *maybe_field_bytes;
+          if (field_bytes > data_size - offset) {
             if (verbose_) {
               std::cerr << "[ZMQPackedMessageSubscriber] Field " << field.name 
                         << " exceeds data bounds" << std::endl;
@@ -343,6 +401,15 @@ class ZMQPackedMessageSubscriber {
           }
           buffers.push_back(BufferView{data_start + offset, field_bytes});
           offset += field_bytes;
+        }
+
+        if (offset != data_size) {
+          if (verbose_) {
+            std::cerr << "[ZMQPackedMessageSubscriber] Payload has "
+                      << (data_size - offset)
+                      << " undeclared trailing bytes" << std::endl;
+          }
+          return false;
         }
 
         if (verbose_) {
@@ -371,7 +438,26 @@ class ZMQPackedMessageSubscriber {
       }
       int poll_count = 0;
       while (running_) {
-        PollOnce();
+        try {
+          PollOnce();
+        } catch (const std::exception &e) {
+          // A callback allocation/copy failure must not escape a std::thread
+          // and terminate the controller process.  Publish the failure as an
+          // atomic state; the endpoint converts it to the normal damping stop.
+          // ALWAYS say why: a silent fail-closed latch reads as a mystery
+          // crash to the operator and the supervisor alike.
+          std::cerr << "[ZMQPackedMessageSubscriber] SUBSCRIBER_FAILED: "
+                    << e.what() << std::endl;
+          failed_.store(true, std::memory_order_release);
+          running_.store(false, std::memory_order_release);
+          break;
+        } catch (...) {
+          std::cerr << "[ZMQPackedMessageSubscriber] SUBSCRIBER_FAILED: "
+                       "non-standard exception" << std::endl;
+          failed_.store(true, std::memory_order_release);
+          running_.store(false, std::memory_order_release);
+          break;
+        }
         poll_count++;
       }
       if (verbose_) {
@@ -393,24 +479,63 @@ class ZMQPackedMessageSubscriber {
     bool DecodeHeaderJSON(const std::string& header_json, DecodedHeader& out) const {
       try {
         auto j = nlohmann::json::parse(header_json);
-        if (j.contains("v")) out.version = j["v"].get<int>();
+        if (!j.is_object() || !j.contains("v") ||
+            !j["v"].is_number_integer() || !j.contains("fields") ||
+            !j["fields"].is_array()) {
+          return false;
+        }
+        out.version = j["v"].get<int>();
+        if (out.version < 1 || out.version > 4) return false;
         if (j.contains("endian")) out.endian = j["endian"].get<std::string>();
-        if (j.contains("count")) out.count = j["count"].get<int>();
+        if (out.endian != "" && out.endian != "le" && out.endian != "be") {
+          return false;
+        }
+        if (j.contains("profile")) {
+          if (!j["profile"].is_string()) return false;
+          out.profile = j["profile"].get<std::string>();
+          if (out.profile.empty() || out.profile.size() > 96) return false;
+        }
+        if (j.contains("count")) {
+          if (!j["count"].is_number_integer()) return false;
+          out.count = j["count"].get<int>();
+          if (out.count < 0 ||
+              static_cast<size_t>(out.count) > MAX_DIMENSION) return false;
+        }
         out.fields.clear();
-        if (j.contains("fields") && j["fields"].is_array()) {
-          for (const auto& f : j["fields"]) {
+        if (j["fields"].empty() || j["fields"].size() > MAX_FIELDS) {
+          return false;
+        }
+        std::unordered_set<std::string> field_names;
+        for (const auto& f : j["fields"]) {
+            if (!f.is_object() || !f.contains("name") ||
+                !f["name"].is_string() || !f.contains("dtype") ||
+                !f["dtype"].is_string() || !f.contains("shape") ||
+                !f["shape"].is_array()) {
+              return false;
+            }
             FieldInfo fi;
-            if (f.contains("name")) fi.name = f["name"].get<std::string>();
-            if (f.contains("dtype")) fi.dtype = f["dtype"].get<std::string>();
+            fi.name = f["name"].get<std::string>();
+            fi.dtype = f["dtype"].get<std::string>();
+            if (fi.name.empty() || fi.name.size() > 64 ||
+                !field_names.insert(fi.name).second || !fi.GetElementSize()) {
+              return false;
+            }
             if (f.contains("optional")) fi.optional = f["optional"].get<bool>();
             fi.shape.clear();
-            if (f.contains("shape") && f["shape"].is_array()) {
-              for (const auto& dim : f["shape"]) {
-                fi.shape.push_back(dim.get<size_t>());
+            if (f["shape"].empty() ||
+                f["shape"].size() > MAX_FIELD_RANK) return false;
+            for (const auto& dim : f["shape"]) {
+              if (!dim.is_number_integer()) return false;
+              const int64_t signed_dim = dim.get<int64_t>();
+              if (signed_dim <= 0 ||
+                  static_cast<uint64_t>(signed_dim) > MAX_DIMENSION) {
+                return false;
               }
+              fi.shape.push_back(static_cast<size_t>(signed_dim));
             }
+            const auto bytes = fi.ComputeByteSize();
+            if (!bytes || *bytes > MAX_PAYLOAD_SIZE) return false;
             out.fields.push_back(std::move(fi));
-          }
         }
         return true;
       } catch (...) {
@@ -430,10 +555,10 @@ class ZMQPackedMessageSubscriber {
     std::unique_ptr<zmq::socket_t> socket_;
 
     std::atomic<bool> running_;
+    std::atomic<bool> failed_{false};
     std::thread recv_thread_;
 
     std::function<void(const std::string&, const DecodedHeader&, const std::vector<BufferView>&)> on_decoded_;
 };
 
 #endif // ZMQ_PACKED_MESSAGE_SUBSCRIBER_HPP
-

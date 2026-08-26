@@ -60,19 +60,79 @@
 #include <unistd.h>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <iostream>
 #include <iomanip>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
+#include <array>
 #include <algorithm>
 #include <cstdlib>
 #include <limits>
 #include <optional>
+#include <bit>
+#include <stdexcept>
 
 #include "input_interface.hpp"
 #include "zmq_packed_message_subscriber.hpp"
 #include "streamed_motion_merger.hpp"
+
+class ZMQTerminalGuard {
+public:
+    ZMQTerminalGuard() = default;
+    ZMQTerminalGuard(const ZMQTerminalGuard&) = delete;
+    ZMQTerminalGuard& operator=(const ZMQTerminalGuard&) = delete;
+
+    void Enable() {
+        if (enabled_) return;
+        original_flags_ = fcntl(STDIN_FILENO, F_GETFL);
+        if (original_flags_ < 0) {
+            throw std::runtime_error("cannot read stdin descriptor flags");
+        }
+
+        if (isatty(STDIN_FILENO)) {
+            if (tcgetattr(STDIN_FILENO, &original_termios_) != 0) {
+                throw std::runtime_error("cannot read terminal attributes");
+            }
+            struct termios raw = original_termios_;
+            raw.c_lflag &= ~(ICANON | ECHO);
+            if (tcsetattr(STDIN_FILENO, TCSANOW, &raw) != 0) {
+                throw std::runtime_error("cannot enter non-canonical terminal mode");
+            }
+            termios_changed_ = true;
+        }
+
+        if (fcntl(STDIN_FILENO, F_SETFL, original_flags_ | O_NONBLOCK) != 0) {
+            Restore();
+            throw std::runtime_error("cannot make stdin non-blocking");
+        }
+        flags_changed_ = true;
+        enabled_ = true;
+    }
+
+    ~ZMQTerminalGuard() { Restore(); }
+
+private:
+    void Restore() noexcept {
+        if (flags_changed_ && original_flags_ >= 0) {
+            (void)fcntl(STDIN_FILENO, F_SETFL, original_flags_);
+        }
+        if (termios_changed_) {
+            (void)tcsetattr(STDIN_FILENO, TCSANOW, &original_termios_);
+        }
+        enabled_ = false;
+        flags_changed_ = false;
+        termios_changed_ = false;
+    }
+
+    struct termios original_termios_{};
+    int original_flags_ = -1;
+    bool enabled_ = false;
+    bool flags_changed_ = false;
+    bool termios_changed_ = false;
+};
 
 /**
  * @class ZMQEndpointInterface
@@ -91,7 +151,10 @@
 class ZMQEndpointInterface : public InputInterface {
 public:
     /// Compile-time toggle for debug log output.
-    static constexpr bool DEBUG_LOGGING = true;
+    // Per-window/per-frame logging runs while the decode mutex is held.  It is
+    // intentionally disabled for the hardware controller: a blocked terminal
+    // must never delay the 50 Hz freshness check or command heartbeat.
+    static constexpr bool DEBUG_LOGGING = false;
     
     // ------------------------------------------------------------------
     // Per-frame action flags (reset at the start of every update() call)
@@ -110,7 +173,7 @@ public:
 
     /// When true, handle_input() reads from the ZMQ stream instead of
     /// pre-loaded reference motions.
-    bool use_zmq_stream = false;
+    std::atomic<bool> use_zmq_stream{false};
     
     /// Reusable sliding-window merger that handles frame alignment, gap
     /// detection, and catch-up logic for streamed motion data.
@@ -147,9 +210,13 @@ public:
     /// the gather that consumes these windows enforces the same contract:
     /// smpl_joints_10frame_step1 is 720 doubles = 24 joints * 3 * 10 frames.
     static constexpr int kRequiredSmplJoints = 24;
+    static constexpr int kRequiredSmplPoses = 21;
+    static constexpr int kRequiredRobotJoints = 29;
+    static constexpr int kMaxIncomingFrames = 512;
+    static constexpr int kMaxQuaternionBodies = 64;
+    static constexpr std::string_view kRequiredWireProfile =
+        "sonic-g1-29dof-mujoco-v1";
 
-    /// Declare the encoder mode streamed windows must map to (-1 = accept any).
-    void SetExpectedStreamMode(int mode) { expected_stream_mode_ = mode; }
     /// The declared stream mode, or -1 when none was declared.
     int GetExpectedStreamMode() const { return expected_stream_mode_; }
 
@@ -175,6 +242,9 @@ public:
     /// requires that announcement after its stream barrier would otherwise
     /// fail a perfectly correct run.
     bool ConsumeStreamEnabled() { return stream_enabled_latch_.exchange(false); }
+    bool IsStreamingActive() const {
+        return use_zmq_stream.load(std::memory_order_acquire);
+    }
 
     static constexpr std::string_view LOCALHOST = "localhost";
 
@@ -183,16 +253,11 @@ public:
         int port = 5556,
         const std::string& topic = "pose",
         bool use_conflate = false,
-        bool verbose = false
-    ) : InputInterface(), host_(host), port_(port), topic_(topic), verbose_(verbose), is_localhost_(host == LOCALHOST) {
+        bool verbose = false,
+        int expected_stream_mode = -1
+    ) : InputInterface(), host_(host), port_(port), topic_(topic), verbose_(verbose),
+        expected_stream_mode_(expected_stream_mode), is_localhost_(host == LOCALHOST) {
         type_ = InputType::NETWORK;
-        
-        // Set terminal to non-blocking mode (same as SimpleKeyboard)
-        tcgetattr(STDIN_FILENO, &old_termios_);
-        struct termios new_termios = old_termios_;
-        new_termios.c_lflag &= ~(ICANON | ECHO);
-        tcsetattr(STDIN_FILENO, TCSANOW, &new_termios);
-        fcntl(STDIN_FILENO, F_SETFL, O_NONBLOCK);
         
         // Create ZMQ subscriber
         subscriber_ = std::make_unique<ZMQPackedMessageSubscriber>(
@@ -212,11 +277,16 @@ public:
             }
         );
         
-        // Start background receiving thread
-        subscriber_->Start();
-        
         // Initialize streamed motion buffer (reserve large capacity for streaming)
         ResetStreamedMotion();
+
+        // Start background receiving only after every callback-visible field is
+        // initialized; an immediately arriving packet can no longer race with
+        // constructor reset and get discarded.
+        if (!subscriber_->Start()) {
+            throw std::runtime_error("failed to start ZMQ pose subscriber");
+        }
+        terminal_guard_.Enable();
         
         std::cout << "[ZMQEndpointInterface] Connected to " << host << ":" << port 
                   << " topic='" << topic << "'" << std::endl;
@@ -227,8 +297,6 @@ public:
         if (subscriber_) {
             subscriber_->Stop();
         }
-        // Restore terminal
-        tcsetattr(STDIN_FILENO, TCSANOW, &old_termios_);
     }
     
     // Flag to trigger safety reset in handle_input
@@ -255,6 +323,13 @@ public:
         reinitialize = false;
         toggle_zmq_mode = false;
         report_temperature = false;
+        if (subscriber_ && subscriber_->HasFailed()) {
+            std::cerr << "[ZMQEndpointInterface] SAFETY: subscriber worker "
+                         "failed; latching the normal damping stop"
+                      << std::endl;
+            stop_control = true;
+            return;
+        }
 
         // Read keyboard input (same as SimpleKeyboard, but without planner keys)
         // Using shared buffered reading
@@ -297,10 +372,11 @@ public:
         std::mutex& current_motion_mutex,
         const std::string& reason)
     {
-        std::cerr << "✗✗✗ ERROR: " << reason << std::endl;
-        std::cerr << "✗✗✗ This is not allowed. Exiting ZMQ streaming mode for safety." << std::endl;
+        operator_state.stop.store(true, std::memory_order_release);
+        use_zmq_stream.store(false, std::memory_order_release);
 
-        use_zmq_stream = false;
+        std::cerr << "✗✗✗ ERROR: " << reason << std::endl;
+        std::cerr << "✗✗✗ This is not allowed. Latching damping stop for safety." << std::endl;
 
         {
             std::lock_guard<std::mutex> lock(current_motion_mutex);
@@ -318,7 +394,8 @@ public:
         std::cout << "=====================================" << std::endl;
         std::cout << "ZMQ STREAMING MODE: FORCE DISABLED" << std::endl;
         std::cout << "=====================================" << std::endl;
-        std::cout << "Returned to reference motion. Re-enable ZMQ mode to continue." << std::endl;
+        std::cout << "Damping stop is latched; restart the controller only after "
+                     "correcting the publisher." << std::endl;
     }
 
     // Handle input and update motion data
@@ -365,8 +442,8 @@ public:
 
         // Handle ZMQ mode toggle
         if (toggle_zmq_mode) {
-            use_zmq_stream = !use_zmq_stream;
-            if (use_zmq_stream) {
+            const bool enable_stream = !use_zmq_stream.load(std::memory_order_acquire);
+            if (enable_stream) {
                 std::cout << "=====================================" << std::endl;
                 std::cout << "ZMQ STREAMING MODE: ENABLED" << std::endl;
                 std::cout << "=====================================" << std::endl;
@@ -384,9 +461,10 @@ public:
                     reinitialize_heading = true; // reset the heading state
                 }
                 // reset streaming buffers when enabling to avoid mixing with stale data
-                ResetStreamedMotion(); // This also resets protocol version in the merger
-                has_new_data_ = false;
+                ResetStreamedMotion(true); // Also starts the bounded first-packet grace window.
+                use_zmq_stream.store(true, std::memory_order_release);
             } else {
+                use_zmq_stream.store(false, std::memory_order_release);
                 std::cout << "=====================================" << std::endl;
                 std::cout << "ZMQ STREAMING MODE: DISABLED" << std::endl;
                 std::cout << "=====================================" << std::endl;
@@ -409,7 +487,6 @@ public:
                 }
                 // reset the streamed motion (also resets protocol version)
                 ResetStreamedMotion();
-                has_new_data_ = false;
             }
         }
         if (stop_control) { operator_state.stop = true; }
@@ -532,10 +609,12 @@ public:
                     operator_state.play = true; // Auto-play when entering ZMQ mode
                     reinitialize_heading = true;
                     
-                    if constexpr (DEBUG_LOGGING) {
-                        std::cout << "[ZMQEndpointInterface] Catch-up: Reset to frame 0 at global frame " 
-                                  << stream_window_start_ << std::endl;
-                    }
+                    // CONTRACT: the sim supervisor latches this exact line
+                    // (CATCH_UP_MARKER) to know streamed playback restarted at
+                    // the clip's first frame.  Debug-gating it silently broke
+                    // every native sim run; it stays unconditional.
+                    std::cout << "[ZMQEndpointInterface] Catch-up: Reset to frame 0 at global frame "
+                              << stream_window_start_ << std::endl;
                 } else {
                     // Normal case: Adjust current_frame to maintain global playback position after window shift
                     // current_frame represents "the next frame to be read" (not yet consumed)
@@ -635,16 +714,146 @@ public:
     }
 
     std::optional<std::chrono::steady_clock::time_point> GetLastUpdateTime() const override {
-      if (is_localhost_) {
-        return data_timestamp_;
+      // Safety freshness is based only on a locally observed, fully validated
+      // and merged packet.  Raw receipt time and publisher timestamps remain
+      // diagnostics; malformed traffic cannot keep the controller armed.  The
+      // timestamp is atomic so the control thread never waits behind network
+      // decode or terminal logging while deciding whether to damp.
+      int64_t ticks = last_accepted_ticks_.load(std::memory_order_acquire);
+      if (ticks == 0) {
+        ticks = stream_enabled_ticks_.load(std::memory_order_acquire);
       }
-      return last_receive_time_;
+      if (ticks == 0) return std::nullopt;
+      return std::chrono::steady_clock::time_point(
+          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+              std::chrono::nanoseconds(ticks)));
     }
     
 private:
+    // This target is compiled with -ffast-math, so std::isfinite may be folded
+    // to true.  Inspect IEEE-754 exponent bits instead for network safety
+    // checks; this remains valid under fast-math optimization.
+    static bool IsFiniteWireValue(float value) {
+        const uint32_t bits = std::bit_cast<uint32_t>(value);
+        return (bits & 0x7f800000U) != 0x7f800000U;
+    }
+
+    static bool IsFiniteWireValue(double value) {
+        const uint64_t bits = std::bit_cast<uint64_t>(value);
+        return (bits & 0x7ff0000000000000ULL) != 0x7ff0000000000000ULL;
+    }
+
+    static int64_t SafetyTicksNow() {
+        return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+    }
+
+    static bool IsRecognizedPoseField(const std::string& name) {
+        static constexpr std::array<std::string_view, 17> kNames = {
+            "joint_pos", "joint_vel", "body_quat", "body_quat_w",
+            "frame_index", "last_smpl_global_frames", "smpl_joints",
+            "smpl_pose", "left_hand_joints", "right_hand_joints",
+            "catch_up", "token_state", "heading_increment",
+            "timestamp_monotonic", "vr_position", "vr_orientation",
+            "vr_compliance"
+        };
+        return std::find(kNames.begin(), kNames.end(), name) != kNames.end();
+    }
+
+    static bool ShapeEquals(
+        const ZMQPackedMessageSubscriber::FieldInfo& field,
+        std::initializer_list<size_t> expected) {
+        return field.shape.size() == expected.size() &&
+               std::equal(field.shape.begin(), field.shape.end(),
+                          expected.begin());
+    }
+
+    bool ValidateFloatFieldStorage(int index, const char* field_name) const {
+        if (index < 0 || static_cast<size_t>(index) >= buffered_header_.fields.size() ||
+            static_cast<size_t>(index) >= buffered_buffers_.size()) {
+            std::cerr << "[ZMQEndpointInterface] Invalid field index for "
+                      << field_name << std::endl;
+            return false;
+        }
+        const auto& field = buffered_header_.fields[static_cast<size_t>(index)];
+        const auto& buffer = buffered_buffers_[static_cast<size_t>(index)];
+        if (field.dtype != "f32" && field.dtype != "f64") {
+            std::cerr << "[ZMQEndpointInterface] Invalid floating dtype for "
+                      << field_name << std::endl;
+            return false;
+        }
+        const auto expected_bytes = field.ComputeByteSize();
+        if (!expected_bytes || *expected_bytes != buffer.size()) {
+            std::cerr << "[ZMQEndpointInterface] Invalid buffer size for "
+                      << field_name << std::endl;
+            return false;
+        }
+
+        const bool needs_swap = buffered_header_.NeedsByteSwap();
+        if (field.dtype == "f32") {
+            for (size_t offset = 0; offset < buffer.size(); offset += sizeof(float)) {
+                float value;
+                std::memcpy(&value, buffer.data() + offset, sizeof(value));
+                if (needs_swap) value = byte_swap(value);
+                if (!IsFiniteWireValue(value)) {
+                    std::cerr << "[ZMQEndpointInterface] Non-finite value in "
+                              << field_name << std::endl;
+                    return false;
+                }
+            }
+        } else {
+            for (size_t offset = 0; offset < buffer.size(); offset += sizeof(double)) {
+                double value;
+                std::memcpy(&value, buffer.data() + offset, sizeof(value));
+                if (needs_swap) value = byte_swap(value);
+                if (!IsFiniteWireValue(value)) {
+                    std::cerr << "[ZMQEndpointInterface] Non-finite value in "
+                              << field_name << std::endl;
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    bool ValidateFloatField(
+        int index,
+        std::initializer_list<size_t> expected_shape,
+        const char* field_name) const {
+        if (index < 0 || static_cast<size_t>(index) >= buffered_header_.fields.size() ||
+            !ShapeEquals(buffered_header_.fields[static_cast<size_t>(index)],
+                         expected_shape)) {
+            std::cerr << "[ZMQEndpointInterface] Invalid shape for "
+                      << field_name << std::endl;
+            return false;
+        }
+        return ValidateFloatFieldStorage(index, field_name);
+    }
+
+    bool ValidateIntegerField(
+        int index,
+        std::initializer_list<size_t> expected_shape,
+        const char* field_name) const {
+        if (index < 0 || static_cast<size_t>(index) >= buffered_header_.fields.size() ||
+            static_cast<size_t>(index) >= buffered_buffers_.size()) return false;
+        const auto& field = buffered_header_.fields[static_cast<size_t>(index)];
+        const auto& buffer = buffered_buffers_[static_cast<size_t>(index)];
+        const auto expected_bytes = field.ComputeByteSize();
+        if (!ShapeEquals(field, expected_shape) ||
+            (field.dtype != "i32" && field.dtype != "i64") ||
+            !expected_bytes || *expected_bytes != buffer.size()) {
+            std::cerr << "[ZMQEndpointInterface] Invalid shape, dtype, or size for "
+                      << field_name << std::endl;
+            return false;
+        }
+        return true;
+    }
+
     /// Reset the streamed motion buffer, merger state, and protocol version.
     /// Called on construction, when toggling ZMQ mode, and on safety reset.
-    void ResetStreamedMotion() {
+    void ResetStreamedMotion(bool starting_stream = false) {
+        std::lock_guard<std::mutex> lock(data_mutex_);
         motion_merger_.Reset();
         active_protocol_version_ = -1;  // Reset protocol version tracking
         // Update legacy fields for backward compatibility
@@ -654,6 +863,16 @@ private:
         stream_window_start_ = 0;
         data_timestamp_.reset();
         last_receive_time_.reset();
+        last_accepted_ticks_.store(0, std::memory_order_release);
+        last_accepted_frame_start_.reset();
+        last_accepted_frame_end_.reset();
+        last_accepted_frame_step_.reset();
+        last_accepted_quat_bodies_.reset();
+        stream_enabled_ticks_.store(starting_stream ? SafetyTicksNow() : 0,
+                                    std::memory_order_release);
+        buffered_header_ = {};
+        buffered_buffers_.clear();
+        has_new_data_ = false;
     }
     
     /// Outcome of DecodeIntoMotionSequence().
@@ -692,6 +911,17 @@ private:
         DecodeResult result;
         if (buffered_buffers_.empty()) {
             std::cerr << "[ZMQEndpointInterface] No buffered buffers" << std::endl;
+            return result;
+        }
+        if (buffered_buffers_.size() != buffered_header_.fields.size()) {
+            std::cerr << "[ZMQEndpointInterface] Header/buffer field-count mismatch"
+                      << std::endl;
+            return result;
+        }
+        if (buffered_header_.profile != kRequiredWireProfile) {
+            std::cerr << "[ZMQEndpointInterface] Missing or incompatible pose "
+                         "wire profile; require " << kRequiredWireProfile
+                      << std::endl;
             return result;
         }
         
@@ -749,8 +979,20 @@ private:
             const auto& f = buffered_header_.fields[i];
             if (f.name == "joint_pos") joint_pos_idx = static_cast<int>(i);
             else if (f.name == "joint_vel") joint_vel_idx = static_cast<int>(i);
-            else if (f.name == "body_quat_w" || f.name == "body_quat") body_quat_idx = static_cast<int>(i);
-            else if (f.name == "frame_index" || f.name == "last_smpl_global_frames") frame_index_idx = static_cast<int>(i);
+            else if (f.name == "body_quat_w" || f.name == "body_quat") {
+                if (body_quat_idx >= 0) {
+                    std::cerr << "[ZMQEndpointInterface] Conflicting body-quaternion aliases" << std::endl;
+                    return result;
+                }
+                body_quat_idx = static_cast<int>(i);
+            }
+            else if (f.name == "frame_index" || f.name == "last_smpl_global_frames") {
+                if (frame_index_idx >= 0) {
+                    std::cerr << "[ZMQEndpointInterface] Conflicting frame-index aliases" << std::endl;
+                    return result;
+                }
+                frame_index_idx = static_cast<int>(i);
+            }
             else if (f.name == "smpl_joints") smpl_joints_idx = static_cast<int>(i);
             else if (f.name == "smpl_pose") smpl_pose_idx = static_cast<int>(i);
             else if (f.name == "left_hand_joints") left_hand_joints_idx = static_cast<int>(i);
@@ -763,6 +1005,11 @@ private:
             else if (f.name == "vr_position") vr_position_idx = static_cast<int>(i);
             else if (f.name == "vr_orientation") vr_orientation_idx = static_cast<int>(i);
             else if (f.name == "vr_compliance") vr_compliance_idx = static_cast<int>(i);
+            else {
+                std::cerr << "[ZMQEndpointInterface] Unknown pose field: "
+                          << f.name << std::endl;
+                return result;
+            }
         }
         
         // ===== PROTOCOL VERSION 4: Token-Only Streaming (check first, has different requirements) =====
@@ -770,6 +1017,23 @@ private:
             // Token-only mode - no motion data, just tokens for the policy
             if (token_state_idx < 0) {
                 std::cerr << "[ZMQEndpointInterface] Version 4 missing required field 'token_state'" << std::endl;
+                return result;
+            }
+
+            if (!ValidateFloatFieldStorage(token_state_idx, "token_state")) {
+                return result;
+            }
+            const auto validate_v4_hand = [this](int index, const char* name) {
+                if (index < 0) return true;
+                const auto& field = buffered_header_.fields[static_cast<size_t>(index)];
+                const bool valid_shape = ShapeEquals(field, {7}) ||
+                                         ShapeEquals(field, {1, 7});
+                return valid_shape && ValidateFloatFieldStorage(index, name);
+            };
+            if (!validate_v4_hand(left_hand_joints_idx, "left_hand_joints") ||
+                !validate_v4_hand(right_hand_joints_idx, "right_hand_joints")) {
+                std::cerr << "[ZMQEndpointInterface] Version 4 invalid hand payload"
+                          << std::endl;
                 return result;
             }
 
@@ -957,6 +1221,7 @@ private:
             
             // Return success with protocol version but no motion (token-only)
             result.protocol_version = 4;
+            last_accepted_ticks_.store(SafetyTicksNow(), std::memory_order_release);
             return result;
         }
         
@@ -1070,9 +1335,135 @@ private:
             }
         }
         
-        if (num_frames <= 0) {
+        if (num_frames < 2) {
             std::cerr << "[ZMQEndpointInterface] Invalid number of frames: " << num_frames << std::endl;
             return result;
+        }
+        if (num_frames > kMaxIncomingFrames) {
+            std::cerr << "[ZMQEndpointInterface] Incoming frame count "
+                      << num_frames << " exceeds safety cap "
+                      << kMaxIncomingFrames << std::endl;
+            return result;
+        }
+
+        // Validate the complete metadata and storage contract before the first
+        // memcpy or side effect.  All recognized actuator/policy fields in a
+        // packet are atomic: one malformed optional rejects the whole window.
+        const size_t frame_count = static_cast<size_t>(num_frames);
+        if (buffered_header_.count != num_frames) {
+            std::cerr << "[ZMQEndpointInterface] Header count does not match "
+                         "the derived motion-frame count" << std::endl;
+            return result;
+        }
+        const bool has_joint_pos = joint_pos_idx >= 0;
+        const bool has_joint_vel = joint_vel_idx >= 0;
+        if (has_joint_pos != has_joint_vel) {
+            std::cerr << "[ZMQEndpointInterface] joint_pos/joint_vel must be paired"
+                      << std::endl;
+            return result;
+        }
+        if (has_joint_pos &&
+            (!ValidateFloatField(joint_pos_idx,
+                                 {frame_count, kRequiredRobotJoints},
+                                 "joint_pos") ||
+             !ValidateFloatField(joint_vel_idx,
+                                 {frame_count, kRequiredRobotJoints},
+                                 "joint_vel"))) {
+            return result;
+        }
+
+        {
+            const auto& field = buffered_header_.fields[static_cast<size_t>(body_quat_idx)];
+            const bool shape_valid =
+                ShapeEquals(field, {frame_count, 4}) ||
+                (field.shape.size() == 3 && field.shape[0] == frame_count &&
+                 field.shape[1] > 0 &&
+                 field.shape[1] <= static_cast<size_t>(kMaxQuaternionBodies) &&
+                 field.shape[2] == 4);
+            if (!shape_valid ||
+                !ValidateFloatFieldStorage(body_quat_idx, "body_quat")) {
+                std::cerr << "[ZMQEndpointInterface] Invalid body_quat contract"
+                          << std::endl;
+                return result;
+            }
+        }
+
+        const bool has_smpl_joints_field = smpl_joints_idx >= 0;
+        const bool has_smpl_pose_field = smpl_pose_idx >= 0;
+        if (has_smpl_joints_field != has_smpl_pose_field) {
+            std::cerr << "[ZMQEndpointInterface] smpl_joints/smpl_pose must be paired"
+                      << std::endl;
+            return result;
+        }
+        if (has_smpl_joints_field &&
+            (!ValidateFloatField(smpl_joints_idx,
+                                 {frame_count, kRequiredSmplJoints, 3},
+                                 "smpl_joints") ||
+             !ValidateFloatField(smpl_pose_idx,
+                                 {frame_count, kRequiredSmplPoses, 3},
+                                 "smpl_pose"))) {
+            return result;
+        }
+
+        if (!ValidateIntegerField(frame_index_idx, {frame_count}, "frame_index")) {
+            return result;
+        }
+
+        const auto validate_hand = [this](int index, const char* name) {
+            if (index < 0) return true;
+            const auto& field = buffered_header_.fields[static_cast<size_t>(index)];
+            return (ShapeEquals(field, {7}) || ShapeEquals(field, {1, 7})) &&
+                   ValidateFloatFieldStorage(index, name);
+        };
+        if (!validate_hand(left_hand_joints_idx, "left_hand_joints") ||
+            !validate_hand(right_hand_joints_idx, "right_hand_joints")) {
+            std::cerr << "[ZMQEndpointInterface] Invalid hand-joint payload"
+                      << std::endl;
+            return result;
+        }
+
+        const auto validate_vr = [this](
+            int index, std::initializer_list<std::vector<size_t>> shapes,
+            const char* name) {
+            if (index < 0) return true;
+            const auto& field = buffered_header_.fields[static_cast<size_t>(index)];
+            const bool shape_valid = std::any_of(
+                shapes.begin(), shapes.end(), [&field](const auto& shape) {
+                  return field.shape == shape;
+                });
+            return shape_valid && ValidateFloatFieldStorage(index, name);
+        };
+        if (!validate_vr(vr_position_idx, {{9}, {1, 9}, {3, 3}}, "vr_position") ||
+            !validate_vr(vr_orientation_idx, {{12}, {1, 12}, {3, 4}}, "vr_orientation") ||
+            !validate_vr(vr_compliance_idx, {{3}, {1, 3}}, "vr_compliance")) {
+            std::cerr << "[ZMQEndpointInterface] Invalid VR payload" << std::endl;
+            return result;
+        }
+        if (heading_increment_idx >= 0 &&
+            !ValidateFloatField(heading_increment_idx, {1}, "heading_increment")) {
+            return result;
+        }
+        if (timestamp_monotonic_idx >= 0) {
+            const auto& field = buffered_header_.fields[
+                static_cast<size_t>(timestamp_monotonic_idx)];
+            if (field.dtype != "f64" ||
+                !ValidateFloatField(timestamp_monotonic_idx, {1},
+                                    "timestamp_monotonic")) {
+                return result;
+            }
+        }
+        if (catch_up_idx >= 0) {
+            const auto& field = buffered_header_.fields[static_cast<size_t>(catch_up_idx)];
+            const auto& buffer = buffered_buffers_[static_cast<size_t>(catch_up_idx)];
+            const auto expected_bytes = field.ComputeByteSize();
+            const bool dtype_valid = field.dtype == "bool" || field.dtype == "u8" ||
+                                     field.dtype == "i32" || field.dtype == "i64";
+            if (!ShapeEquals(field, {1}) || !dtype_valid || !expected_bytes ||
+                *expected_bytes != buffer.size()) {
+                std::cerr << "[ZMQEndpointInterface] Invalid catch_up payload"
+                          << std::endl;
+                return result;
+            }
         }
         
         // Get num_joints if joint data is present
@@ -1083,8 +1474,11 @@ private:
             // Validate shapes: expect [N, num_joints]
             if (joint_pos_field.shape.size() == 2 && joint_vel_field.shape.size() == 2) {
                 num_joints = static_cast<int>(joint_pos_field.shape[1]);
-                if (num_joints <= 0) {
-                    std::cerr << "[ZMQEndpointInterface] Invalid number of joints: " << num_joints << std::endl;
+                if (num_joints != kRequiredRobotJoints ||
+                    joint_vel_field.shape[1] !=
+                        static_cast<size_t>(kRequiredRobotJoints)) {
+                    std::cerr << "[ZMQEndpointInterface] Expected exactly "
+                              << kRequiredRobotJoints << " robot joints" << std::endl;
                     return result;
                 }
             }
@@ -1161,6 +1555,12 @@ private:
         } else if (quat_field.shape.size() == 2) {
             num_quat_bodies = 1;
         }
+        if (last_accepted_quat_bodies_ &&
+            num_quat_bodies != *last_accepted_quat_bodies_) {
+            std::cerr << "[ZMQEndpointInterface] body_quat body count changed; "
+                         "toggle streaming to re-arm" << std::endl;
+            return result;
+        }
         
         // Decode quaternions: [frame][body][xyzw]
         std::vector<std::vector<std::array<double, 4>>> decoded_body_quat(num_frames);
@@ -1190,6 +1590,25 @@ private:
                         if (needs_swap) val = byte_swap(val);
                         decoded_body_quat[frame][body][q] = val;
                     }
+                }
+            }
+        }
+
+        for (const auto& frame_quaternions : decoded_body_quat) {
+            for (const auto& quaternion : frame_quaternions) {
+                double norm_squared = 0.0;
+                for (const double component : quaternion) {
+                    if (std::abs(component) > 2.0) {
+                        std::cerr << "[ZMQEndpointInterface] body_quat component out of range"
+                                  << std::endl;
+                        return result;
+                    }
+                    norm_squared += component * component;
+                }
+                if (norm_squared < 0.25 || norm_squared > 2.25) {
+                    std::cerr << "[ZMQEndpointInterface] Degenerate body quaternion"
+                              << std::endl;
+                    return result;
                 }
             }
         }
@@ -1585,6 +2004,56 @@ private:
             }
         }
 
+
+        if (frame_indices.size() != static_cast<size_t>(num_frames)) {
+            std::cerr << "[ZMQEndpointInterface] frame_index cardinality mismatch"
+                      << std::endl;
+            return result;
+        }
+        int64_t frame_step = 1;
+        for (size_t i = 0; i < frame_indices.size(); ++i) {
+            if (frame_indices[i] < 0 ||
+                frame_indices[i] > std::numeric_limits<int>::max()) {
+                std::cerr << "[ZMQEndpointInterface] frame_index outside int range"
+                          << std::endl;
+                return result;
+            }
+            if (i > 0) {
+                const int64_t delta = frame_indices[i] - frame_indices[i - 1];
+                if (delta <= 0 || delta > 1000 ||
+                    (i > 1 && delta != frame_step)) {
+                    std::cerr << "[ZMQEndpointInterface] frame_index must be strictly "
+                                 "increasing with constant stride <= 1000"
+                              << std::endl;
+                    return result;
+                }
+                frame_step = delta;
+            }
+        }
+        if (last_accepted_frame_step_ &&
+            frame_step != *last_accepted_frame_step_) {
+            std::cerr << "[ZMQEndpointInterface] frame_index stride changed; "
+                         "toggle streaming to re-arm" << std::endl;
+            return result;
+        }
+        const int64_t incoming_frame_start = frame_indices.front();
+        const int64_t incoming_frame_end = frame_indices.back();
+        if ((last_accepted_frame_start_ &&
+             incoming_frame_start <= *last_accepted_frame_start_) ||
+            (last_accepted_frame_end_ &&
+             incoming_frame_end <= *last_accepted_frame_end_)) {
+            std::cerr << "[ZMQEndpointInterface] frame_index window did not "
+                         "advance at both boundaries; toggle streaming to "
+                         "explicitly re-arm after a publisher restart"
+                      << std::endl;
+            return result;
+        }
+
+        // Decode optional side-channel values into locals.  They are committed
+        // only after the complete motion window merges successfully.
+        std::optional<double> decoded_heading_increment;
+        std::optional<std::chrono::steady_clock::time_point> decoded_data_timestamp;
+
         // Optional: decode heading_increment (single scalar, f32 or f64)
         if (heading_increment_idx >= 0) {
           double heading_increment = 0.0;
@@ -1606,15 +2075,12 @@ private:
             }
           }
 
-          auto current_heading_state = heading_state_buffer.GetDataWithTime().data;
-          HeadingState current_state =
-            current_heading_state ? *current_heading_state : HeadingState();
-
-          // Add increment to current heading
-          heading_state_buffer.SetData(
-              HeadingState(
-                current_state.init_base_quat,
-                current_state.delta_heading + heading_increment));
+          if (std::abs(heading_increment) > 1.0) {
+            std::cerr << "[ZMQEndpointInterface] heading_increment exceeds 1 rad"
+                      << std::endl;
+            return result;
+          }
+          decoded_heading_increment = heading_increment;
         }
 
         // Optional: decode monotonic timestamp (single scalar, f64)
@@ -1632,10 +2098,22 @@ private:
           }
           if (is_localhost_)
           {
+            const auto now = std::chrono::steady_clock::now();
+            const double now_seconds =
+                std::chrono::duration<double>(now.time_since_epoch()).count();
+            // Bound the floating value before duration_cast; converting a
+            // finite but enormous double to the clock's integer duration is
+            // otherwise outside the representable range.
+            if (timestamp_monotonic < now_seconds - 3600.0 ||
+                timestamp_monotonic > now_seconds + 1.0) {
+              std::cerr << "[ZMQEndpointInterface] timestamp_monotonic outside "
+                           "the accepted local-clock window" << std::endl;
+              return result;
+            }
             auto duration_monotonic = std::chrono::duration<double>(timestamp_monotonic);
             auto time_point_monotonic = std::chrono::steady_clock::time_point(
                 std::chrono::duration_cast<std::chrono::steady_clock::duration>(duration_monotonic));
-            data_timestamp_ = time_point_monotonic;
+            decoded_data_timestamp = time_point_monotonic;
           }
         }
 
@@ -1766,13 +2244,8 @@ private:
         // ===== STEP 3: Validate protocol version (application-specific) =====
         
         // Check protocol version before merging
-        if (active_protocol_version_ == -1) {
-            // First message - establish protocol version
-            active_protocol_version_ = protocol_version;
-            if constexpr (DEBUG_LOGGING) {
-                std::cout << "[ZMQEndpointInterface] Protocol version " << active_protocol_version_ << " established" << std::endl;
-            }
-        } else if (active_protocol_version_ != protocol_version) {
+        if (active_protocol_version_ != -1 &&
+            active_protocol_version_ != protocol_version) {
             // Protocol version changed - this is an error
             std::cerr << "[ZMQEndpointInterface] ERROR: Protocol version changed from " 
                       << active_protocol_version_ << " to " << protocol_version << std::endl;
@@ -1806,11 +2279,40 @@ private:
             std::cerr << "[ZMQEndpointInterface] Failed to merge incoming data" << std::endl;
             return result;
         }
+
+        // Commit progress only after the entire window validated and merged.
+        // Overlapping windows are allowed, but replaying one valid window can
+        // no longer refresh the hardware watchdog indefinitely.
+        last_accepted_frame_start_ = incoming_frame_start;
+        last_accepted_frame_end_ = incoming_frame_end;
+        last_accepted_frame_step_ = frame_step;
+        last_accepted_quat_bodies_ = num_quat_bodies;
+
+        if (active_protocol_version_ == -1) {
+            active_protocol_version_ = protocol_version;
+            if constexpr (DEBUG_LOGGING) {
+                std::cout << "[ZMQEndpointInterface] Protocol version "
+                          << active_protocol_version_ << " established" << std::endl;
+            }
+        }
+
+        if (decoded_heading_increment) {
+          auto current_heading_state = heading_state_buffer.GetDataWithTime().data;
+          const HeadingState current_state =
+              current_heading_state ? *current_heading_state : HeadingState();
+          heading_state_buffer.SetData(
+              HeadingState(current_state.init_base_quat,
+                           current_state.delta_heading +
+                               *decoded_heading_increment));
+        }
+        if (decoded_data_timestamp) {
+          data_timestamp_ = decoded_data_timestamp;
+        }
         
         // Convert MergeResult to DecodeResult.  The version -> mode mapping
         // lives in EncodeModeForProtocolVersion() so that the declared-kind
         // gate at STEP 0 and this stamp can never drift apart.
-        const int merged_encode_mode = EncodeModeForProtocolVersion(active_protocol_version_);
+        const int merged_encode_mode = EncodeModeForProtocolVersion(protocol_version);
         if (merged_encode_mode >= 0) {
             merge_result.motion->SetEncodeMode(merged_encode_mode);
         }
@@ -1896,6 +2398,7 @@ private:
             }
         }
         last_decode_time_ = decode_end_time;
+        last_accepted_ticks_.store(SafetyTicksNow(), std::memory_order_release);
 
         return result;
     }
@@ -1912,13 +2415,31 @@ private:
         const ZMQPackedMessageSubscriber::DecodedHeader& hdr,
         const std::vector<ZMQPackedMessageSubscriber::BufferView>& bufs) {
         
+        if (hdr.profile != kRequiredWireProfile) return;
+        bool saw_body_quat = false;
+        bool saw_frame_index = false;
+        for (const auto& field : hdr.fields) {
+            const bool body_alias = field.name == "body_quat" ||
+                                    field.name == "body_quat_w";
+            const bool frame_alias = field.name == "frame_index" ||
+                                     field.name == "last_smpl_global_frames";
+            if ((body_alias && saw_body_quat) ||
+                (frame_alias && saw_frame_index) ||
+                !IsRecognizedPoseField(field.name)) {
+                return;
+            }
+            saw_body_quat = saw_body_quat || body_alias;
+            saw_frame_index = saw_frame_index || frame_alias;
+        }
+
         std::lock_guard<std::mutex> lock(data_mutex_);
         
-        // Print message received info
-        std::cout << "[ZMQEndpointInterface] Received ZMQ message - topic: '" << topic 
-                  << "', protocol_version: " << hdr.version 
-                  << ", num_fields: " << hdr.fields.size() 
-                  << ", total_size: " << bufs.size() << " buffers" << std::endl;
+        if constexpr (DEBUG_LOGGING) {
+            std::cout << "[ZMQEndpointInterface] Received ZMQ message - topic: '" << topic
+                      << "', protocol_version: " << hdr.version
+                      << ", num_fields: " << hdr.fields.size()
+                      << ", total_size: " << bufs.size() << " buffers" << std::endl;
+        }
         
         // Buffer the received data for processing in handle_input (main thread)
         buffered_header_ = hdr;
@@ -1943,11 +2464,6 @@ private:
     std::string topic_;   ///< ZMQ subscription topic.
     bool verbose_;        ///< Verbose logging flag.
     
-    /// Background subscriber for the pose / motion topic.
-    std::unique_ptr<ZMQPackedMessageSubscriber> subscriber_;
-    
-    struct termios old_termios_;  ///< Saved terminal state for restoration on destruction.
-    
     // ------------------------------------------------------------------
     // Thread-safe data buffering (written by ZMQ subscriber thread, read by input thread)
     // ------------------------------------------------------------------
@@ -1971,8 +2487,19 @@ private:
     bool is_localhost_ = true;         ///< True if host_ is localhost (for directly comparing timestamps)
     std::optional<std::chrono::steady_clock::time_point> data_timestamp_{};  ///< Timestamp of last received message from XR source
     std::optional<std::chrono::steady_clock::time_point> last_receive_time_{}; ///< Timestamp of last OnPoseDataReceived (ms, monotonic).
+    std::atomic<int64_t> last_accepted_ticks_{0}; ///< Local monotonic nanoseconds of last fully validated and merged packet.
+    std::atomic<int64_t> stream_enabled_ticks_{0}; ///< Fixed first-packet grace origin; never refreshed by traffic.
+    std::optional<int64_t> last_accepted_frame_start_{}; ///< Replay guard, protected by data_mutex_.
+    std::optional<int64_t> last_accepted_frame_end_{}; ///< Replay guard, protected by data_mutex_.
+    std::optional<int64_t> last_accepted_frame_step_{}; ///< Pinned stride, protected by data_mutex_.
+    std::optional<int> last_accepted_quat_bodies_{}; ///< Pinned quaternion body count, protected by data_mutex_.
     uint64_t receive_count_ = 0;       ///< Total number of messages received.
     uint64_t last_decode_time_ = 0;    ///< Timestamp of last DecodeIntoMotionSequence call (ms).
+
+    // Declared after every callback-visible field so construction unwinding
+    // stops/joins the receive thread before destroying its targets.
+    std::unique_ptr<ZMQPackedMessageSubscriber> subscriber_;
+    ZMQTerminalGuard terminal_guard_;
     
 };
 

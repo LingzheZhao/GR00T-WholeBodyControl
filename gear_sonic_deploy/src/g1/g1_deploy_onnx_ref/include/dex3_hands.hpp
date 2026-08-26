@@ -195,6 +195,17 @@ public:
         }
     }
 
+    // Publish a stop command directly, bypassing the mutable command buffers.
+    // This is used by the body-command watchdog: an in-flight control tick may
+    // still overwrite a buffered hand target after shutdown is latched, so a
+    // buffered stop is not a sufficient wire-side safety boundary.
+    void writeStopOnce()
+    {
+        const auto command = makeStopCommand();
+        if (left_.publisher) { left_.publisher->Write(command); }
+        if (right_.publisher) { right_.publisher->Write(command); }
+    }
+
     // Returns a snapshot of the latest state for the requested hand.
     std::shared_ptr<const unitree_hg::msg::dds_::HandState_> getState(bool is_left) const
     {
@@ -291,18 +302,7 @@ public:
     void stop(bool is_left)
     {
         HandCtx &ctx = is_left ? left_ : right_;
-        unitree_hg::msg::dds_::HandCmd_ cmd; sizeCommand(cmd);
-        for (int i = 0; i < DEX3_MOTOR_MAX; ++i)
-        {
-            auto &m = cmd.motor_cmd()[i];
-            m.mode(makeMode(static_cast<uint8_t>(i), /*status*/ 0x01, /*timeout*/ 0x01));
-            m.tau(0);
-            m.dq(0);
-            m.kp(0);
-            m.kd(0);
-            m.q(0);
-        }
-        ctx.cmd_buffer.SetData(std::move(cmd));
+        ctx.cmd_buffer.SetData(makeStopCommand());
     }
 
     // Quick helper: HOLD - hold current pose with gains (default kp=1.5, kd=0.1, dq=0, tau=0)
@@ -397,6 +397,24 @@ private:
             cmd.motor_cmd()[i].kd(0.1);
             cmd.motor_cmd()[i].tau(0);
         }
+    }
+
+    static unitree_hg::msg::dds_::HandCmd_ makeStopCommand()
+    {
+        unitree_hg::msg::dds_::HandCmd_ cmd;
+        sizeCommand(cmd);
+        for (int i = 0; i < DEX3_MOTOR_MAX; ++i)
+        {
+            auto &m = cmd.motor_cmd()[i];
+            m.mode(makeMode(static_cast<uint8_t>(i), /*status*/ 0x01,
+                            /*timeout*/ 0x01));
+            m.tau(0);
+            m.dq(0);
+            m.kp(0);
+            m.kd(0);
+            m.q(0);
+        }
+        return cmd;
     }
 
     void onState(bool is_left, const void *message)

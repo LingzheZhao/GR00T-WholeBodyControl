@@ -20,6 +20,7 @@
 #define ROBOT_PARAMETERS_HPP
 
 #include <array>
+#include <atomic>
 
 // ---------------------------------------------------------------------------
 // Unitree SDK DDS topic names
@@ -97,9 +98,13 @@ struct HeadingState {
  * @brief High-level operator signals (set by input interfaces, read by control loop).
  */
 struct OperatorState {
-  bool stop = false;   ///< Emergency stop requested.
-  bool start = false;  ///< Control-system start requested.
-  bool play = false;   ///< Motion playback active.
+  // These flags are written by the 100 Hz input thread and read by the
+  // control thread and main thread.  Plain bools make those reads/writes a
+  // C++ data race, including the emergency-stop path.  Atomics keep the
+  // existing assignment/boolean syntax while making the hand-off defined.
+  std::atomic<bool> stop{false};   ///< Emergency stop requested.
+  std::atomic<bool> start{false};  ///< Control-system start requested.
+  std::atomic<bool> play{false};   ///< Motion playback active.
 };
 
 /**

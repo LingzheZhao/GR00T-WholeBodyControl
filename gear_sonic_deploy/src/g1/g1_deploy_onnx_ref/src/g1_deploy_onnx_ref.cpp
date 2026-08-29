@@ -312,7 +312,7 @@ void ValidateInvocationProfileOrThrow(
     const std::string& hardware_profile,
     bool enable_command_q_clamp,
     const std::optional<double>& command_max_delta_rad,
-    bool manual_init_arm,
+    bool manual_takeover_authorization,
     bool enable_dex3_hands) {
   if (simulation_only) {
     if (!disable_crc_check || network_interface != "lo") {
@@ -338,13 +338,14 @@ void ValidateInvocationProfileOrThrow(
         "physical runtime requires --hardware-profile " +
         std::string(kHardwareProfileId));
   }
-  if (!manual_init_arm || enable_dex3_hands || !enable_command_q_clamp ||
-      !command_max_delta_rad.has_value() ||
+  if (!manual_takeover_authorization || enable_dex3_hands ||
+      !enable_command_q_clamp || !command_max_delta_rad.has_value() ||
       !IsFiniteCommandValue(*command_max_delta_rad) ||
       *command_max_delta_rad <= 0.0) {
     throw std::runtime_error(
-        "physical runtime requires --manual-init-arm, --disable-dex3-hands, "
-        "--enable-command-q-clamp, and --command-max-delta-rad");
+        "physical runtime requires --manual-takeover-authorization, "
+        "--disable-dex3-hands, --enable-command-q-clamp, and "
+        "--command-max-delta-rad");
   }
   if (input_type != "zmq") {
     throw std::runtime_error(
@@ -438,7 +439,7 @@ std::string BuildSonicCapabilityLine(const std::vector<EncoderModeConfig>& encod
        << ",\"simulation_only_flag\":true"
        << ",\"simulation_interface\":\"lo\""
        << ",\"active_motor_count\":29"
-       << ",\"manual_init_arm_pre_release\":true"
+       << ",\"manual_takeover_authorization\":true"
        << ",\"dex3_disable_flag\":true"
        << ",\"command_q_clamp_flag\":true"
        << ",\"command_delta_limit_flag\":true"
@@ -595,10 +596,10 @@ const uint8_t required_mode_machine_;  ///< Immutable validated command identity
     // DDS callback writes this while the 500 Hz command thread reads it.
     std::atomic<uint8_t> mode_machine_; ///< Robot variant code received from LowState.
     std::atomic<bool> mode_machine_received_{false};
-    // Armed after the first fresh profile check, before the quiet-window and
+    // Latched after the first fresh profile check, before the quiet-window and
     // MotionSwitcher handoff.  A transient identity change can never be hidden
     // by changing back before the next synchronous check.
-    std::atomic<bool> profile_gate_armed_{false};
+    std::atomic<bool> profile_gate_latched_{false};
     std::atomic<bool> profile_divergence_latched_{false};
     
     // =========================================================================
@@ -2714,7 +2715,7 @@ const uint8_t required_mode_machine_;  ///< Immutable validated command identity
         // simulated robot hung limp on the harness band, and it collapsed
         // the moment the band dropped.  Reach the exact state the physical
         // path reaches after its confirmed-empty CheckMode: quiet guard
-        // disarmed, takeover marked, gate opened with the synchronous
+        // cleared, takeover marked, gate opened with the synchronous
         // damping write, guard reader torn down.
         lowcmd_quiet_check_active_.store(false, std::memory_order_release);
         lowcmd_takeover_started_ = true;
@@ -2863,7 +2864,7 @@ const uint8_t required_mode_machine_;  ///< Immutable validated command identity
             : mode_machine_.load(std::memory_order_acquire);
         if (profile_divergence_latched_.load(std::memory_order_acquire)) {
           throw std::runtime_error(
-              "robot profile identity diverged after the takeover gate was armed");
+              "robot profile identity diverged after the takeover gate was latched");
         }
 
         bool ready = low_state.data && torso_imu.data &&
@@ -2915,7 +2916,7 @@ const uint8_t required_mode_machine_;  ///< Immutable validated command identity
             last_ready_tick = tick;
             consecutive_ready_samples = 1;
             if (required_mode_machine_ == kPhysicalModeMachine) {
-              profile_gate_armed_.store(true, std::memory_order_release);
+              profile_gate_latched_.store(true, std::memory_order_release);
             }
             ready = false;
           } else if (tick == *last_ready_tick) {
@@ -2928,7 +2929,7 @@ const uint8_t required_mode_machine_;  ///< Immutable validated command identity
         }
 
         if (ready) {
-          profile_gate_armed_.store(true, std::memory_order_release);
+          profile_gate_latched_.store(true, std::memory_order_release);
           std::cout << "[SAFETY] Fresh CRC-valid LowState and torso IMU; "
                        "mode_machine="
                     << unsigned(observed_mode) << ", mode_pr="
@@ -2954,7 +2955,7 @@ const uint8_t required_mode_machine_;  ///< Immutable validated command identity
           "; observed mode_machine=" + observed);
     }
 
-    void WaitForManualInitArmOrThrow() {
+    void WaitForManualTakeoverAuthorizationOrThrow() {
       std::cout << "[SAFETY] High-level motion service still owns the robot. "
                    "Press ] to authorize low-level takeover and the 3-second "
                    "stand ramp; press O to cancel."
@@ -2962,13 +2963,13 @@ const uint8_t required_mode_machine_;  ///< Immutable validated command identity
       while (true) {
         if (g_shutdown_requested) {
           throw std::runtime_error(
-              "shutdown requested before manual low-level takeover arm");
+              "shutdown requested before manual takeover authorization");
         }
         char key = 0;
         const ssize_t bytes = ::read(STDIN_FILENO, &key, 1);
         if (bytes == 1) {
           if (key == ']') {
-            std::cout << "[SAFETY] Manual INIT arm accepted" << std::endl;
+            std::cout << "[SAFETY] Takeover authorized" << std::endl;
             return;
           }
           if (key == 'o' || key == 'O') {
@@ -2978,7 +2979,8 @@ const uint8_t required_mode_machine_;  ///< Immutable validated command identity
         } else if (bytes < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
                    errno != EINTR) {
           throw std::runtime_error(
-              "failed to read manual INIT arm from attached terminal");
+              "failed to read manual takeover authorization from attached "
+              "terminal");
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
       }
@@ -3020,7 +3022,7 @@ const uint8_t required_mode_machine_;  ///< Immutable validated command identity
       double initial_max_close_ratio = 1.0,
       bool enable_command_q_clamp = false,
       std::optional<double> command_max_delta_rad = std::nullopt,
-      bool manual_init_arm = false,
+      bool manual_takeover_authorization = false,
       bool enable_dex3_hands = true,
       bool simulation_only = false,
       std::string hardware_profile = "")
@@ -3057,8 +3059,8 @@ const uint8_t required_mode_machine_;  ///< Immutable validated command identity
       ValidateInvocationProfileOrThrow(
           networkInterface, model_file_path, encoder_file_path, obs_config_path,
           input_type, disable_crc_check, simulation_only, hardware_profile,
-          enable_command_q_clamp, command_max_delta_rad, manual_init_arm,
-          enable_dex3_hands);
+          enable_command_q_clamp, command_max_delta_rad,
+          manual_takeover_authorization, enable_dex3_hands);
 
       // No robot-facing SDK object is created until profile validation returns.
       ChannelFactory::Instance()->Init(0, networkInterface);
@@ -3530,10 +3532,11 @@ const uint8_t required_mode_machine_;  ///< Immutable validated command identity
             "command_writer", UT_CPU_ID_NONE, publish_dt_ * 1e6,
             &G1Deploy::LowCommandWriter, this);
         command_writer_ptr_->SetPriority(99);
-        if (manual_init_arm) {
-          WaitForManualInitArmOrThrow();
-          // The operator may wait arbitrarily long at the arm prompt.  Re-run
-          // the complete freshness/profile gate immediately before release.
+        if (manual_takeover_authorization) {
+          WaitForManualTakeoverAuthorizationOrThrow();
+          // The operator may wait arbitrarily long at the authorization
+          // prompt.  Re-run the complete freshness/profile gate immediately
+          // before release.
           WaitForFreshAuthorizedRobotStateOrThrow();
         }
         RequireQuietLowCmdChannelOrThrow();
@@ -3669,8 +3672,8 @@ const uint8_t required_mode_machine_;  ///< Immutable validated command identity
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
       }
-      // Keep the guard armed while ReleaseMode is requested and CheckMode is
-      // polled.  At the confirmed-empty boundary it is atomically disarmed,
+      // Keep the guard active while ReleaseMode is requested and CheckMode is
+      // polled.  At the confirmed-empty boundary it is atomically cleared,
       // damping publication starts immediately, and only then is the DDS
       // reader torn down.  This avoids putting a reader join in the handoff gap.
     }
@@ -3775,7 +3778,7 @@ const uint8_t required_mode_machine_;  ///< Immutable validated command identity
       const bool takeover_active =
           low_level_takeover_active_.load(std::memory_order_acquire);
       const bool identity_monitor_active =
-          takeover_active || profile_gate_armed_.load(std::memory_order_acquire);
+          takeover_active || profile_gate_latched_.load(std::memory_order_acquire);
       if (identity_monitor_active &&
           (incoming_mode != required_mode_machine_ ||
            low_state.mode_pr() != kRequiredModePr)) {
@@ -5572,7 +5575,7 @@ void PrintUsage(const char* program) {
   std::cout << "  --hardware-profile <id>: require the exact derived physical profile (physical runtime only)" << std::endl;
   std::cout << "  --enable-command-q-clamp: clamp policy q targets to hard G1 joint limits (default: disabled)" << std::endl;
   std::cout << "  --command-max-delta-rad <rad>: limit each q target change per 50 Hz control tick (default: disabled)" << std::endl;
-  std::cout << "  --manual-init-arm: keep the high-level service in control until ] authorizes takeover and the 3-second INIT ramp" << std::endl;
+  std::cout << "  --manual-takeover-authorization: require the operator's ] takeover authorization before the low-level takeover and the 3-second INIT stand ramp" << std::endl;
   std::cout << "  --disable-dex3-hands: do not create or publish Dex3 hand command channels" << std::endl;
   std::cout << "  --obs-config <path>: specify observation configuration YAML file" << std::endl;
   std::cout << "  --print-capabilities: with --obs-config, print the SONIC_CAPABILITIES_V1 line and exit (no robot/GPU needed)" << std::endl;
@@ -5610,7 +5613,7 @@ void PrintUsage(const char* program) {
   std::cout << "  config does not declare, prints '<name> invalid: <value>' and exits 1." << std::endl;
   std::cout << "\nExamples:" << std::endl;
   std::cout << "  " << program << " lo policy/single_frame/model.onnx reference/bones_072925_test/ --planner-file policy/planner.onnx --obs-config policy/single_frame/observation_config.yaml --disable-crc-check --simulation-only" << std::endl;
-  std::cout << "  SONIC_FORCE_ENCODE_MODE=0 SONIC_EXPECTED_STREAM_MODE=0 " << program << " enp5s0 policy/release/model_decoder.onnx reference/example --obs-config policy/release/observation_config.yaml --encoder-file policy/release/model_encoder.onnx --input-type zmq --hardware-profile sonic-g1-mode5-derived-v1 --manual-init-arm --disable-dex3-hands --enable-command-q-clamp --command-max-delta-rad <validated-rad>" << std::endl;
+  std::cout << "  SONIC_FORCE_ENCODE_MODE=0 SONIC_EXPECTED_STREAM_MODE=0 " << program << " enp5s0 policy/release/model_decoder.onnx reference/example --obs-config policy/release/observation_config.yaml --encoder-file policy/release/model_encoder.onnx --input-type zmq --hardware-profile sonic-g1-mode5-derived-v1 --manual-takeover-authorization --disable-dex3-hands --enable-command-q-clamp --command-max-delta-rad <validated-rad>" << std::endl;
   std::cout << "  " << program << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type gamepad --planner-file policy/planner.onnx" << std::endl;
   std::cout << "  " << program << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type gamepad_manager --planner-file policy/planner.onnx --zmq-host localhost --zmq-port 5556" << std::endl;
   std::cout << "  " << program << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type zmq --zmq-host 192.168.1.2 --zmq-port 5556 --zmq-topic pose --zmq-conflate" << std::endl;
@@ -5731,7 +5734,7 @@ int main(int argc, char const* argv[]) {
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
   bool enableCommandQClamp = false;
   std::optional<double> commandMaxDeltaRad;
-  bool manualInitArm = false;
+  bool manualTakeoverAuthorization = false;
   bool enableDex3Hands = true;
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
@@ -5751,9 +5754,9 @@ int main(int argc, char const* argv[]) {
     } else if (std::string(argv[i]) == "--enable-command-q-clamp") {
       enableCommandQClamp = true;
       std::cout << "[INFO] Policy command q-target hard clamp enabled" << std::endl;
-    } else if (std::string(argv[i]) == "--manual-init-arm") {
-      manualInitArm = true;
-      std::cout << "[SAFETY] Manual INIT arm enabled" << std::endl;
+    } else if (std::string(argv[i]) == "--manual-takeover-authorization") {
+      manualTakeoverAuthorization = true;
+      std::cout << "[SAFETY] Manual takeover authorization enabled" << std::endl;
     } else if (std::string(argv[i]) == "--disable-dex3-hands") {
       enableDex3Hands = false;
       std::cout << "[SAFETY] Dex3 hand actuation disabled" << std::endl;
@@ -6026,7 +6029,7 @@ int main(int argc, char const* argv[]) {
     ValidateInvocationProfileOrThrow(
         networkInterface, modelFile, encoderFile, obsConfigPath, inputType,
         disableCrcCheck, simulationOnly, hardwareProfile, enableCommandQClamp,
-        commandMaxDeltaRad, manualInitArm, enableDex3Hands);
+        commandMaxDeltaRad, manualTakeoverAuthorization, enableDex3Hands);
   } catch (const std::exception& error) {
     std::cerr << "Error: " << error.what() << std::endl;
     return 1;
@@ -6088,7 +6091,7 @@ int main(int argc, char const* argv[]) {
     initial_max_close_ratio,
     enableCommandQClamp,
     commandMaxDeltaRad,
-    manualInitArm,
+    manualTakeoverAuthorization,
     enableDex3Hands,
     simulationOnly,
     hardwareProfile

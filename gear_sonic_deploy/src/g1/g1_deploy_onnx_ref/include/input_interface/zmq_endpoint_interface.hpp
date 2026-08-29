@@ -716,9 +716,10 @@ public:
     std::optional<std::chrono::steady_clock::time_point> GetLastUpdateTime() const override {
       // Safety freshness is based only on a locally observed, fully validated
       // and merged packet.  Raw receipt time and publisher timestamps remain
-      // diagnostics; malformed traffic cannot keep the controller armed.  The
-      // timestamp is atomic so the control thread never waits behind network
-      // decode or terminal logging while deciding whether to damp.
+      // diagnostics; malformed traffic cannot keep the controller's streaming
+      // gate open.  The timestamp is atomic so the control thread never waits
+      // behind network decode or terminal logging while deciding whether to
+      // damp.
       int64_t ticks = last_accepted_ticks_.load(std::memory_order_acquire);
       if (ticks == 0) {
         ticks = stream_enabled_ticks_.load(std::memory_order_acquire);
@@ -1558,7 +1559,7 @@ private:
         if (last_accepted_quat_bodies_ &&
             num_quat_bodies != *last_accepted_quat_bodies_) {
             std::cerr << "[ZMQEndpointInterface] body_quat body count changed; "
-                         "toggle streaming to re-arm" << std::endl;
+                         "toggle streaming to re-enable it" << std::endl;
             return result;
         }
         
@@ -2033,7 +2034,7 @@ private:
         if (last_accepted_frame_step_ &&
             frame_step != *last_accepted_frame_step_) {
             std::cerr << "[ZMQEndpointInterface] frame_index stride changed; "
-                         "toggle streaming to re-arm" << std::endl;
+                         "toggle streaming to re-enable it" << std::endl;
             return result;
         }
         const int64_t incoming_frame_start = frame_indices.front();
@@ -2044,7 +2045,8 @@ private:
              incoming_frame_end <= *last_accepted_frame_end_)) {
             std::cerr << "[ZMQEndpointInterface] frame_index window did not "
                          "advance at both boundaries; toggle streaming to "
-                         "explicitly re-arm after a publisher restart"
+                         "explicitly re-enable streaming after a publisher "
+                         "restart"
                       << std::endl;
             return result;
         }

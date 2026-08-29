@@ -200,20 +200,26 @@ bool IsFiniteCommandValue(double value) noexcept {
 // refuses the window, the gather below refuses the bundle.
 constexpr size_t kSonicSmplJointCount = 24;
 
-// This build intentionally supports one physical pairing only.  The pairing
-// is an engineering-derived match between NVIDIA's released policy constants
-// and Unitree's public mode matrix; neither vendor has attested the checkpoint
-// for a particular serial-number or firmware range.  These constants are code
-// review boundaries, not values loaded from a user-editable manifest.
+// This build intentionally supports one physical pairing only: the released
+// (mode-11-trained) checkpoint actuating the lab's mode-5 G1
+// (g1_29dof_rev_1_0).  The pairing is engineering-derived and maintainer-
+// authorized (2026-08-29) on the cross-revision transfer study's simulation
+// evidence (motionlcm_deploy issue #4, docs/rev_transfer_study.md); neither
+// vendor has attested the checkpoint for any hardware.  The trained gains in
+// policy_parameters.hpp are deliberately unchanged: action_scale couples
+// displacement-per-action and torque-per-action (0.25 * effort_limit /
+// stiffness), so no gain rescale can preserve both — the mode-5 actuator
+// enforces its own 88 N-m hip-pitch ceiling physically.  These constants are
+// code review boundaries, not values loaded from a user-editable manifest.
 constexpr std::string_view kHardwareProfileId =
-    "sonic-g1-mode11-derived-v1";
+    "sonic-g1-mode5-derived-v1";
 constexpr std::string_view kDecoderSha256 =
     "c7241a123eaa36b5d64bad19540efde93cac1ad443bd4572fd12ca99898118ed";
 constexpr std::string_view kEncoderSha256 =
     "013ab0287236aa2721e13f1e936d699db982302d0de0bfcdae76d5c3245362d3";
 constexpr std::string_view kObservationConfigSha256 =
     "466d05947c78af6c76388adfb86e3a2a77b2a1d921a64883ed3d085ebf58de1b";
-constexpr uint8_t kPhysicalModeMachine = 11;
+constexpr uint8_t kPhysicalModeMachine = 5;
 constexpr uint8_t kRequiredModePr = 0;
 constexpr uint8_t kSimulationModeMachine = 0;
 
@@ -2928,7 +2934,7 @@ const uint8_t required_mode_machine_;  ///< Immutable validated command identity
                     << unsigned(observed_mode) << ", mode_pr="
                     << unsigned(low_state.data->mode_pr()) << " accepted for "
                     << (required_mode_machine_ == kSimulationModeMachine
-                            ? "simulator" : "derived mode-11 G1 profile")
+                            ? "simulator" : "derived mode-5 G1 profile")
                     << " takeover after " << consecutive_ready_samples
                     << " advancing samples" << std::endl;
           return;
@@ -3510,7 +3516,7 @@ const uint8_t required_mode_machine_;  ///< Immutable validated command identity
       }
 
       // Independent runtime identity/freshness gate.  Physical construction
-      // reaches this point only for the exact derived mode-11 profile and
+      // reaches this point only for the exact derived mode-5 profile and
       // reviewed checkpoint artifacts validated before DDS initialization.
       WaitForFreshAuthorizedRobotStateOrThrow();
       CreateDampingCommand();
@@ -3579,8 +3585,12 @@ const uint8_t required_mode_machine_;  ///< Immutable validated command identity
               &G1Deploy::Planner, this);
         }
         SetControlWorkerThreadPriorities();
-        std::cout << "[SAFETY] INIT ramp has begun. After 'Init Done', press ] "
-                     "once more to enter policy control."
+        // Deliberately does not contain the literal completion-marker text:
+        // the browser-path supervisor stage-matches on that substring, and an
+        // advisory that repeats it would fire the match ~3 s early, at ramp
+        // start instead of ramp completion.
+        std::cout << "[SAFETY] INIT ramp has begun. When the ramp completes, "
+                     "press ] once more to enter policy control."
                   << std::endl;
         control_workers_active_.store(true, std::memory_order_release);
       } catch (...) {
@@ -5600,7 +5610,7 @@ void PrintUsage(const char* program) {
   std::cout << "  config does not declare, prints '<name> invalid: <value>' and exits 1." << std::endl;
   std::cout << "\nExamples:" << std::endl;
   std::cout << "  " << program << " lo policy/single_frame/model.onnx reference/bones_072925_test/ --planner-file policy/planner.onnx --obs-config policy/single_frame/observation_config.yaml --disable-crc-check --simulation-only" << std::endl;
-  std::cout << "  SONIC_FORCE_ENCODE_MODE=0 SONIC_EXPECTED_STREAM_MODE=0 " << program << " enp5s0 policy/release/model_decoder.onnx reference/example --obs-config policy/release/observation_config.yaml --encoder-file policy/release/model_encoder.onnx --input-type zmq --hardware-profile sonic-g1-mode11-derived-v1 --manual-init-arm --disable-dex3-hands --enable-command-q-clamp --command-max-delta-rad <validated-rad>" << std::endl;
+  std::cout << "  SONIC_FORCE_ENCODE_MODE=0 SONIC_EXPECTED_STREAM_MODE=0 " << program << " enp5s0 policy/release/model_decoder.onnx reference/example --obs-config policy/release/observation_config.yaml --encoder-file policy/release/model_encoder.onnx --input-type zmq --hardware-profile sonic-g1-mode5-derived-v1 --manual-init-arm --disable-dex3-hands --enable-command-q-clamp --command-max-delta-rad <validated-rad>" << std::endl;
   std::cout << "  " << program << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type gamepad --planner-file policy/planner.onnx" << std::endl;
   std::cout << "  " << program << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type gamepad_manager --planner-file policy/planner.onnx --zmq-host localhost --zmq-port 5556" << std::endl;
   std::cout << "  " << program << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type zmq --zmq-host 192.168.1.2 --zmq-port 5556 --zmq-topic pose --zmq-conflate" << std::endl;

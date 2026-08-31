@@ -21,7 +21,7 @@
  * ## `{user_topic}` (e.g. `g1_debug`) — published every tick
  * ---------------------------------------------------------------------------
  *
- * A single msgpack map with up to 33 keys (29 always-present + 4 conditional).
+ * A single msgpack map with up to 35 keys (30 always-present + 5 conditional).
  * All joints are in **MuJoCo order** (remapped from IsaacLab via
  * `isaaclab_to_mujoco`).
  *
@@ -30,55 +30,57 @@
  *      | **Metadata**           |              |
  *   1  | control_loop_type      | string       | Always "cpp".
  *   2  | index                  | int          | Monotonic state-logger entry index.
- *   3  | ros_timestamp          | double       | ROS 2 wall-clock (s); 0.0 if no ROS 2.
+ *   3  | debug_published_monotonic_ns | uint64  | CLOCK_MONOTONIC ns captured as this packet is constructed.
+ *   4  | ros_timestamp          | double       | ROS 2 wall-clock (s); 0.0 if no ROS 2.
  *      |                        |              |
  *      | **Base IMU**           |              |
- *   4  | base_quat              | double[4]    | Base IMU quaternion (w,x,y,z).
- *   5  | base_ang_vel           | double[3]    | Base angular velocity.
- *   6  | body_torso_quat        | double[4]    | Torso IMU quaternion.
- *   7  | body_torso_ang_vel     | double[3]    | Torso angular velocity.
+ *   5  | base_quat              | double[4]    | Base IMU quaternion (w,x,y,z).
+ *   6  | base_ang_vel           | double[3]    | Base angular velocity.
+ *   7  | body_torso_quat        | double[4]    | Torso IMU quaternion.
+ *   8  | body_torso_ang_vel     | double[3]    | Torso angular velocity.
  *      |                        |              |
  *      | **Body joints**        |              |
- *   8  | body_q                 | double[29]   | Joint positions (+ default offsets).
- *   9  | body_dq                | double[29]   | Joint velocities.
+ *   9  | body_q                 | double[29]   | Joint positions (+ default offsets).
+ *  10  | body_dq                | double[29]   | Joint velocities.
  *      |                        |              |
  *      | **Hand joints**        |              |
- *  10  | left_hand_q            | double[7]    | Left-hand joint positions (from state logger).
- *  11  | left_hand_dq           | double[7]    | Left-hand joint velocities.
- *  12  | right_hand_q           | double[7]    | Right-hand joint positions (from state logger).
- *  13  | right_hand_dq          | double[7]    | Right-hand joint velocities.
+ *  11  | left_hand_q            | double[7]    | Left-hand joint positions (from state logger).
+ *  12  | left_hand_dq           | double[7]    | Left-hand joint velocities.
+ *  13  | right_hand_q           | double[7]    | Right-hand joint positions (from state logger).
+ *  14  | right_hand_dq          | double[7]    | Right-hand joint velocities.
  *      |                        |              |
  *      | **Policy actions**     |              |
- *  14  | last_action            | double[29]   | Legacy previous-tick action target.
- *  15  | raw_q_des              | double[29]   | Current raw target (conditional: command safety enabled).
- *  16  | executed_q_des         | double[29]   | Current MotorCommand target (same condition/tick as raw_q_des).
- *  17  | last_left_hand_action  | double[7]    | Last left-hand action.
- *  18  | last_right_hand_action | double[7]    | Last right-hand action.
+ *  15  | last_action            | double[29]   | Legacy previous-tick action target.
+ *  16  | raw_q_des              | double[29]   | Current raw target (conditional: command safety enabled).
+ *  17  | executed_q_des         | double[29]   | Current MotorCommand target (same condition/tick as raw_q_des).
+ *  18  | previous_executed_q_des | double[29]  | Exact delta-limiter left edge (same condition/tick).
+ *  19  | last_left_hand_action  | double[7]    | Last left-hand action.
+ *  20  | last_right_hand_action | double[7]    | Last right-hand action.
  *      |                        |              |
  *      | **Encoder**            |              |
- *  19  | token_state            | double[N]    | Encoder token state (empty array if N/A).
- *  20  | motor_temperature      | double[58]   | Winding/driver temperatures for 29 motors.
+ *  21  | token_state            | double[N]    | Encoder token state (empty array if N/A).
+ *  22  | motor_temperature      | double[58]   | Winding/driver temperatures for 29 motors.
  *      |                        |              |
  *      | **Heading** *(conditional — only when heading state is available)* |
- *  21  | init_base_quat         | double[4]    | Initial base quaternion at heading init.
- *  22  | delta_heading          | double       | Accumulated heading delta (rad).
+ *  23  | init_base_quat         | double[4]    | Initial base quaternion at heading init.
+ *  24  | delta_heading          | double       | Accumulated heading delta (rad).
  *      |                        |              |
  *      | **Viz: targets** *(from current motion frame + heading correction)* |
- *  23  | base_trans_target      | double[3]    | Target base translation.
- *  24  | base_quat_target       | double[4]    | Target base quaternion.
- *  25  | body_q_target          | double[29]   | Target joint positions.
+ *  25  | base_trans_target      | double[3]    | Target base translation.
+ *  26  | base_quat_target       | double[4]    | Target base quaternion.
+ *  27  | body_q_target          | double[29]   | Target joint positions.
  *      |                        |              |
  *      | **Viz: measured**      |              |
- *  26  | base_trans_measured    | double[3]    | Measured base translation (fixed default).
- *  27  | base_quat_measured     | double[4]    | Measured base quaternion (= base_quat).
- *  28  | body_q_measured        | double[29]   | Measured joint positions (= body_q).
- *  29  | left_hand_q_measured   | double[7]    | Measured left-hand Dex3 positions.
- *  30  | right_hand_q_measured  | double[7]    | Measured right-hand Dex3 positions.
+ *  28  | base_trans_measured    | double[3]    | Measured base translation (fixed default).
+ *  29  | base_quat_measured     | double[4]    | Measured base quaternion (= base_quat).
+ *  30  | body_q_measured        | double[29]   | Measured joint positions (= body_q).
+ *  31  | left_hand_q_measured   | double[7]    | Measured left-hand Dex3 positions.
+ *  32  | right_hand_q_measured  | double[7]    | Measured right-hand Dex3 positions.
  *      |                        |              |
  *      | **Viz: VR 3-point**    |              |
- *  31  | vr_3point_position     | double[9]    | VR positions (3×xyz, target body frame).
- *  32  | vr_3point_orientation  | double[12]   | VR orientations (3×quat wxyz).
- *  33  | vr_3point_compliance   | double[3]    | VR compliance (left arm, right arm, head).
+ *  33  | vr_3point_position     | double[9]    | VR positions (3×xyz, target body frame).
+ *  34  | vr_3point_orientation  | double[12]   | VR orientations (3×quat wxyz).
+ *  35  | vr_3point_compliance   | double[3]    | VR compliance (left arm, right arm, head).
  *
  * ---------------------------------------------------------------------------
  * ## `robot_config` — re-published every ~2 s
@@ -114,6 +116,7 @@
 #include <msgpack.hpp>
 
 #include "output_interface.hpp"
+#include "debug_monotonic_clock.hpp"
 #include "../policy_parameters.hpp"  // For isaaclab_to_mujoco, default_angles, g1_action_scale
 #include "../robot_parameters.hpp"   // For HeadingState
 #include "../utils.hpp"              // For DataBuffer
@@ -282,13 +285,15 @@ private:
             has_heading_state = true;
         }
 
-        // State-logger fields: 18 base + 2 optional heading + 2 optional
-        // same-tick command targets.
+        // State-logger fields: 19 base + 2 optional heading + 3 optional
+        // same-tick command targets plus their exact delta-limiter left edge.
         // Visualisation fields: output_data_map_.size() (typically 11)
         const bool has_command_targets = state.has_command_targets;
-        int num_state_fields = (has_heading_state ? 20 : 18) +
-                               (has_command_targets ? 2 : 0);
+        int num_state_fields = (has_heading_state ? 21 : 19) +
+                               (has_command_targets ? 3 : 0);
         int num_viz_fields = static_cast<int>(output_data_map_.size());
+        const std::uint64_t debug_published_monotonic_ns =
+            sonic::telemetry::ReadDebugPublishedMonotonicNs();
         pk.pack_map(num_state_fields + num_viz_fields);
 
         // ---- State-logger fields ----
@@ -298,6 +303,9 @@ private:
 
         pk.pack("index");
         pk.pack(state.index);
+
+        pk.pack("debug_published_monotonic_ns");
+        pk.pack(debug_published_monotonic_ns);
 
         pk.pack("ros_timestamp");
         pk.pack(state.ros_timestamp);
@@ -364,6 +372,10 @@ private:
             pk.pack("executed_q_des");
             pk.pack_array(state.executed_q_des.size());
             for (const auto& val : state.executed_q_des) pk.pack(val);
+
+            pk.pack("previous_executed_q_des");
+            pk.pack_array(state.previous_executed_q_des.size());
+            for (const auto& val : state.previous_executed_q_des) pk.pack(val);
         }
 
         pk.pack("left_hand_q");

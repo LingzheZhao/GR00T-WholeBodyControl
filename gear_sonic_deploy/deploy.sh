@@ -7,13 +7,16 @@ set -e
 # This script handles the complete setup and deployment process for g1_deploy
 # Following the steps from the README.md
 #
-# Usage: ./deploy.sh [sim|real|<interface_name>|<ip_address>]
+# Usage: ./deploy.sh [sim]
 #   sim   - Use loopback interface for simulation (MuJoCo)
-#   real  - Auto-detect robot network interface (192.168.123.x)
-#   <interface_name> - Use specific interface (e.g., enP8p1s0, eth0)
-#   <ip_address> - Use interface with specific IP
 #
-# Default: real
+# Physical controller execution is deliberately disabled in this convenience
+# script.  The reviewed hardware path is the repository-level authenticated
+# serve daemon (`scripts/real_robot.sh serve`) plus its local web backend.
+# `real`, a non-loopback interface, and a non-loopback IP all fail closed before
+# prerequisites, builds, or controller execution.
+#
+# Default: sim
 # ============================================================================
 
 # Colors for output
@@ -200,7 +203,7 @@ resolve_interface() {
 # ============================================================================
 
 show_usage() {
-    echo "Usage: $0 [OPTIONS] [sim|real|<interface>]"
+    echo "Usage: $0 [OPTIONS] [sim]"
     echo ""
     echo "Options:"
     echo "  -h, --help              Show this help message"
@@ -214,25 +217,23 @@ show_usage() {
     echo ""
     echo "Interface modes:"
     echo "  sim              Use loopback interface for simulation (MuJoCo)"
-    echo "  real             Auto-detect robot network (192.168.123.x)"
-    echo "  <interface>      Use specific interface (e.g., enP8p1s0, eth0)"
-    echo "  <ip_address>     Use interface by IP address"
+    echo "  real             DISABLED here; use the authenticated serve daemon"
+    echo "  <interface>      DISABLED unless it resolves to the loopback interface"
+    echo "  <ip_address>     DISABLED unless it is exactly 127.0.0.1"
     echo ""
-    echo "Default: real"
+    echo "Default: sim"
+    echo ""
+    echo "Physical G1 launches are browser-staged through the repository-level"
+    echo "scripts/real_robot.sh serve daemon; this upstream helper cannot launch them."
     echo ""
     echo "Examples:"
     echo "  $0 sim           # Run in simulation mode"
-    echo "  $0 real          # Auto-detect real robot interface"
-    echo "  $0 enP8p1s0      # Use specific interface"
-    echo "  $0 192.168.x.x # Use interface with this IP"
-    echo "  $0 --cp policy/checkpoints/custom/model_step_123456 real  # Use custom checkpoint"
     echo "  $0 --obs-config policy/configs/custom.yaml sim  # Use custom obs config"
-    echo "  $0 --planner planner/custom.onnx --input-type keyboard real  # Use custom planner and input"
     echo "  $0 --motion-data reference/custom_motion/ sim  # Use custom motion data"
 }
 
 # Default interface mode
-INTERFACE_MODE="real"
+INTERFACE_MODE="sim"
 
 # Default configuration values (can be overridden by command line)
 CHECKPOINT_DEFAULT="policy/release/model"
@@ -349,6 +350,26 @@ resolve_interface "$INTERFACE_MODE"
 echo -e "Resolved interface: ${GREEN}$TARGET${NC}"
 echo -e "Environment type:   ${GREEN}$ENV_TYPE${NC}"
 echo ""
+
+# This tracked upstream helper used to be a second, weaker physical launch
+# path: it could build and run g1_deploy_onnx_ref after only a Y/n prompt.  Keep
+# its useful loopback simulator, but make every physical classification a hard
+# refusal before dependency installation, builds, or `just run`.  The explicit
+# target allowlist makes the simulation claim independent of an unusual NIC
+# carrying a 127.0.0.1 alias.
+if [[ "$ENV_TYPE" != "sim" ]]; then
+    echo -e "${RED}ERROR: direct physical G1 execution from gear_sonic_deploy/deploy.sh is disabled.${NC}" >&2
+    echo "Use scripts/real_robot.sh serve with the authenticated local web backend;" >&2
+    echo "that path owns clearance admission, exact-binary pinning, deadman, and E-STOP cleanup." >&2
+    exit 64
+fi
+case "$TARGET" in
+    lo|lo0|127.0.0.1) ;;
+    *)
+        echo -e "${RED}ERROR: simulation target must be explicit loopback, not: $TARGET${NC}" >&2
+        exit 64
+        ;;
+esac
 
 # ============================================================================
 # Configuration
@@ -537,12 +558,9 @@ echo ""
 echo -e "${CYAN}═══════════════════════════════════════════════════════════════════════${NC}"
 echo ""
 
-# Ask for confirmation
-if [[ "$ENV_TYPE" == "real" ]]; then
-    echo -e "${YELLOW}⚠️  WARNING: This will start the REAL robot control system!${NC}"
-else
-    echo -e "${YELLOW}📋 This will start the simulation control system.${NC}"
-fi
+# Ask for confirmation.  Physical classifications exited before Step 1, so
+# reaching this point is an explicit loopback simulation.
+echo -e "${YELLOW}📋 This will start the loopback simulation control system.${NC}"
 echo ""
 read -p "$(echo -e ${GREEN}Proceed with deployment? [Y/n]: ${NC})" confirm
 

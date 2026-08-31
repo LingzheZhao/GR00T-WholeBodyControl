@@ -74,8 +74,10 @@
 #include <optional>
 #include <bit>
 #include <stdexcept>
+#include <utility>
 
 #include "input_interface.hpp"
+#include "stream_episode.hpp"
 #include "zmq_packed_message_subscriber.hpp"
 #include "streamed_motion_merger.hpp"
 
@@ -215,10 +217,15 @@ public:
     static constexpr int kMaxIncomingFrames = 512;
     static constexpr int kMaxQuaternionBodies = 64;
     static constexpr std::string_view kRequiredWireProfile =
-        "sonic-g1-29dof-mujoco-v1";
+        "sonic-g1-29dof-isaaclab-v1";
 
     /// The declared stream mode, or -1 when none was declared.
     int GetExpectedStreamMode() const { return expected_stream_mode_; }
+
+    /// Exact physical run identifier, or no expectation for legacy/simulation.
+    const std::optional<std::string>& GetExpectedStreamEpisode() const {
+        return expected_stream_episode_;
+    }
 
     /// Encoder mode a streamed window is stamped with, derived from its pose
     /// protocol version: v1 carries retargeted G1 joints (mode 0), v2 and v3
@@ -246,6 +253,20 @@ public:
         return use_zmq_stream.load(std::memory_order_acquire);
     }
 
+    /// Local receipt time of the last packet that completed every wire,
+    /// profile, shape, finite-value, ordering, and motion-merge check.
+    /// This deliberately has no stream-enable grace fallback: the physical
+    /// WAIT_FOR_CONTROL gate uses it to prove real streamed bytes are active.
+    std::optional<std::chrono::steady_clock::time_point>
+    GetLastAcceptedUpdateTime() const {
+        const int64_t ticks =
+            last_accepted_ticks_.load(std::memory_order_acquire);
+        if (ticks == 0) return std::nullopt;
+        return std::chrono::steady_clock::time_point(
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::nanoseconds(ticks)));
+    }
+
     static constexpr std::string_view LOCALHOST = "localhost";
 
     ZMQEndpointInterface(
@@ -254,9 +275,18 @@ public:
         const std::string& topic = "pose",
         bool use_conflate = false,
         bool verbose = false,
-        int expected_stream_mode = -1
+        int expected_stream_mode = -1,
+        std::optional<std::string> expected_stream_episode = std::nullopt
     ) : InputInterface(), host_(host), port_(port), topic_(topic), verbose_(verbose),
-        expected_stream_mode_(expected_stream_mode), is_localhost_(host == LOCALHOST) {
+        expected_stream_mode_(expected_stream_mode),
+        expected_stream_episode_(std::move(expected_stream_episode)),
+        is_localhost_(host == LOCALHOST) {
+        if (expected_stream_episode_.has_value() &&
+            !sonic::stream_episode::IsValidIdentifier(
+                *expected_stream_episode_)) {
+            throw std::invalid_argument(
+                "invalid expected stream episode identifier");
+        }
         type_ = InputType::NETWORK;
         
         // Create ZMQ subscriber
@@ -642,6 +672,15 @@ public:
                     current_motion = streamed_motion_;  // Assign shared_ptr directly for thread safety
                     operator_state.play = true; // Auto-play when entering ZMQ mode
                 }
+
+                // Emitted only after the decoded motion is the active motion.
+                // The physical supervisor must observe this exact barrier
+                // before it can authorize the first policy CONTROL tick.
+                if (first_validated_window_marker_pending_.exchange(
+                        false, std::memory_order_acq_rel)) {
+                    std::cout << "ZMQ FIRST VALIDATED WINDOW: ACCEPTED"
+                              << std::endl;
+                }
                 
             }
             return; // Skip keyboard motion controls when in ZMQ mode
@@ -871,6 +910,8 @@ private:
         last_accepted_quat_bodies_.reset();
         stream_enabled_ticks_.store(starting_stream ? SafetyTicksNow() : 0,
                                     std::memory_order_release);
+        first_validated_window_marker_pending_.store(
+            starting_stream, std::memory_order_release);
         buffered_header_ = {};
         buffered_buffers_.clear();
         has_new_data_ = false;
@@ -923,6 +964,14 @@ private:
             std::cerr << "[ZMQEndpointInterface] Missing or incompatible pose "
                          "wire profile; require " << kRequiredWireProfile
                       << std::endl;
+            return result;
+        }
+        // Physical runs pin every accepted window to the run that launched
+        // this controller.  Keep this second check next to the mutation path
+        // as defense in depth: a mismatch cannot establish protocol state,
+        // touch the merger, refresh freshness, or clear the readiness marker.
+        if (!sonic::stream_episode::MatchesExpected(
+                buffered_header_.episode, expected_stream_episode_)) {
             return result;
         }
         
@@ -2416,7 +2465,18 @@ private:
         const std::string& topic,
         const ZMQPackedMessageSubscriber::DecodedHeader& hdr,
         const std::vector<ZMQPackedMessageSubscriber::BufferView>& bufs) {
-        
+
+        // Drop a missing/stale/cross-run packet before it enters the shared
+        // buffer.  With no expectation (simulation/legacy callers), the same
+        // packet remains accepted for backward compatibility.
+        if (!sonic::stream_episode::MatchesExpected(
+                hdr.episode, expected_stream_episode_)) {
+            if (!stream_episode_refusal_logged_.exchange(
+                    true, std::memory_order_acq_rel)) {
+                std::cout << "STREAM_EPISODE_REFUSED" << std::endl;
+            }
+            return;
+        }
         if (hdr.profile != kRequiredWireProfile) return;
         bool saw_body_quat = false;
         bool saw_frame_index = false;
@@ -2473,6 +2533,10 @@ private:
     /// Written once at startup before any thread runs; read by the input
     /// thread only.
     int expected_stream_mode_ = -1;
+    /// Exact run id required on every packet; absent only for simulation.
+    const std::optional<std::string> expected_stream_episode_;
+    /// Avoid flooding the controller PTY with stale publisher traffic.
+    std::atomic<bool> stream_episode_refusal_logged_{false};
     /// Last time a STREAM_MODE_REFUSED line was printed (rate limiting).
     std::optional<std::chrono::steady_clock::time_point> last_stream_mode_refusal_log_;
     /// Set when streaming is enabled, cleared by ConsumeStreamEnabled().
@@ -2491,6 +2555,7 @@ private:
     std::optional<std::chrono::steady_clock::time_point> last_receive_time_{}; ///< Timestamp of last OnPoseDataReceived (ms, monotonic).
     std::atomic<int64_t> last_accepted_ticks_{0}; ///< Local monotonic nanoseconds of last fully validated and merged packet.
     std::atomic<int64_t> stream_enabled_ticks_{0}; ///< Fixed first-packet grace origin; never refreshed by traffic.
+    std::atomic<bool> first_validated_window_marker_pending_{false}; ///< One readiness marker per stream-enable generation.
     std::optional<int64_t> last_accepted_frame_start_{}; ///< Replay guard, protected by data_mutex_.
     std::optional<int64_t> last_accepted_frame_end_{}; ///< Replay guard, protected by data_mutex_.
     std::optional<int64_t> last_accepted_frame_step_{}; ///< Pinned stride, protected by data_mutex_.

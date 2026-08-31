@@ -61,6 +61,8 @@
 #include <zmq.hpp>
 #include <nlohmann/json.hpp>
 
+#include "stream_episode.hpp"
+
 /// @brief Detect whether the host CPU is little-endian.
 inline bool is_little_endian() {
   uint32_t test = 1;
@@ -187,6 +189,7 @@ class ZMQPackedMessageSubscriber {
       int version = 0;               ///< Protocol version (e.g. 1, 2, 3).
       std::string endian;            ///< "le" or "be" (empty defaults to "le").
       std::string profile;           ///< Publisher-declared joint/schema profile.
+      std::string episode;           ///< Optional exact per-run stream identifier.
       int count = -1;                ///< Optional frame/element count hint.
       std::vector<FieldInfo> fields; ///< Ordered list of binary field descriptors.
       
@@ -494,6 +497,16 @@ class ZMQPackedMessageSubscriber {
           if (!j["profile"].is_string()) return false;
           out.profile = j["profile"].get<std::string>();
           if (out.profile.empty() || out.profile.size() > 96) return false;
+        }
+        const char* episode_key = sonic::stream_episode::kHeaderKey.data();
+        if (j.contains(episode_key)) {
+          if (!j[episode_key].is_string()) return false;
+          out.episode = j[episode_key].get<std::string>();
+          if (!sonic::stream_episode::IsValidIdentifier(out.episode)) {
+            return false;
+          }
+        } else {
+          out.episode.clear();
         }
         if (j.contains("count")) {
           if (!j["count"].is_number_integer()) return false;

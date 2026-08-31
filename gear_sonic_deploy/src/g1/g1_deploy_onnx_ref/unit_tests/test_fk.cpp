@@ -2,17 +2,33 @@
 
 #include "../include/fk.hpp"
 #include "../include/motion_data_reader.hpp"
+#include "../include/mode5_contract_generated.hpp"
 
+#include <filesystem>
 #include <vector>
 #include <fstream>
 
 TEST(FK, TestFKAndGlobalVelocities) {
+#ifndef SONIC_WBC_ROOT
+#error "SONIC_WBC_ROOT must identify the checked WholeBodyControl checkout"
+#endif
+    const auto canonical_mjcf =
+        std::filesystem::path(SONIC_WBC_ROOT) /
+        std::string(sonic::mode5_contract::kFkMjcfPathFromWbcRoot);
+    ASSERT_TRUE(std::filesystem::is_regular_file(canonical_mjcf))
+        << "canonical contract MJCF is unavailable: " << canonical_mjcf;
+    RobotFK fk(canonical_mjcf.string());
+    EXPECT_EQ(fk.NumJoints(), 30);
 
-    // read some exapmle motion data:
+    const auto reference_fixture =
+        std::filesystem::path("reference/bones_072925_test");
+    if (!std::filesystem::is_directory(reference_fixture)) {
+      GTEST_SKIP() << "optional FK CSV regression fixture is unavailable";
+    }
+
     MotionDataReader motion_reader;
-    motion_reader.ReadFromCSV("reference/bones_072925_test/");
-
-    RobotFK fk("g1/g1_29dof.xml");
+    motion_reader.ReadFromCSV(reference_fixture.string());
+    ASSERT_FALSE(motion_reader.motions.empty());
 
     auto num_bodies = motion_reader.motions[0]->GetNumBodies();
     auto num_joints = motion_reader.motions[0]->GetNumJoints();

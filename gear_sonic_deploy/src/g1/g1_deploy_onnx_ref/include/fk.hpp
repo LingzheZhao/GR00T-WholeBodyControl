@@ -2,10 +2,10 @@
  * @file fk.hpp
  * @brief Forward kinematics (FK) for the G1 robot, parsed from a MuJoCo XML model.
  *
- * RobotFK loads a MuJoCo MJCF XML file (e.g. `g1/g1_29dof.xml`), extracts the
- * kinematic tree (joint axes, translations, rest rotations), and provides a
- * `DoFK()` method that computes world-frame positions and orientations for
- * every body given a root pose and joint angles.
+ * RobotFK loads the deployment contract's canonical Unitree rev1 MJCF
+ * (`gear_sonic/data/assets/robot_description/mjcf/g1_29dof_rev_1_0.xml`),
+ * extracts the kinematic tree, and computes world-frame poses from an
+ * IsaacLab-ordered absolute joint pose.
  *
  * The FK result is used by MotionSequence::ComputeFK() to populate body-part
  * positions and quaternions from joint-angle data.

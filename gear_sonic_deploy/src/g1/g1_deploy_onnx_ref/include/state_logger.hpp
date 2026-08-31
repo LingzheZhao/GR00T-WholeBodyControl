@@ -101,6 +101,9 @@ class StateLogger {
     bool has_command_targets = false;
     std::vector<double> raw_q_des;       // hardware / MuJoCo order, radians
     std::vector<double> executed_q_des;  // exact MotorCommand q_target values
+    // Exact command-buffer q_target used as the delta limiter's left edge.
+    // On the first CONTROL tick this is the final executed INIT target.
+    std::vector<double> previous_executed_q_des;
 
     // Motor temperature (2 values per motor: winding temp, driver temp)
     std::vector<double> motor_temperature;  // size = num_joints * 2
@@ -198,7 +201,8 @@ class StateLogger {
    * Returns false for missing/duplicate entries or invalid vector dimensions.
    */
   bool LogCommandTargets(std::span<const double> raw_q_des,
-                         std::span<const double> executed_q_des);
+                         std::span<const double> executed_q_des,
+                         std::span<const double> previous_executed_q_des);
 
   size_t capacity() const;
   size_t size() const;

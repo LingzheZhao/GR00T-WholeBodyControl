@@ -10,8 +10,8 @@
  * `XML_H_IMPLEMENTATION` is defined here (and only here) to pull in the
  * implementation.
  *
- * Joint angle indexing uses `isaaclab_to_mujoco` from policy_parameters.hpp
- * to map the IsaacLab-ordered input array to the MuJoCo kinematic tree order.
+ * Joint indexing/sign/offset use the generated deployment contract to map an
+ * IsaacLab-ordered absolute pose into the canonical rev1 MJCF tree.
  */
 
 #include "fk.hpp"
@@ -145,8 +145,13 @@ void RobotFK::FKChildren(
         positions_world[child_idx][1] += positions_world[parent_idx][1];
         positions_world[child_idx][2] += positions_world[parent_idx][2];
 
+        const size_t hardware_index = child_idx - 1;
+        const size_t policy_index = isaaclab_to_mujoco[hardware_index];
+        const double mjcf_angle =
+            command_sign[hardware_index] * joint_angles[policy_index] +
+            command_offset[hardware_index];
         std::array<double, 4> child_rot = quat_from_angle_axis(
-            joint_angles[isaaclab_to_mujoco[child_idx-1]],
+            mjcf_angle,
             quat_rotate(rest_rotations_[child_idx], axes_[child_idx])
         );
 

@@ -21,6 +21,9 @@
 
 #include <array>
 #include <atomic>
+#include <string>
+
+#include "mode5_contract_generated.hpp"
 
 // ---------------------------------------------------------------------------
 // Unitree SDK DDS topic names
@@ -30,29 +33,24 @@ static const std::string HG_IMU_TORSO = "rt/secondary_imu";///< Secondary (torso
 static const std::string HG_STATE_TOPIC = "rt/lowstate";    ///< Low-level motor / sensor state topic.
 
 /// Total number of actuated joints on the G1 (29-DOF configuration).
-const int G1_NUM_MOTOR = 29;
+inline constexpr int G1_NUM_MOTOR =
+    sonic::mode5_contract::kActiveMotorCount;
 
 /**
  * @brief Hard joint-position limits for the 29-DOF G1, in hardware / MuJoCo order.
  *
- * These values intentionally match `g1/g1_29dof.xml`.  They are not the
- * narrower training-time soft limits and do not include an additional margin.
+ * These values are generated from the deployment contract and mechanically
+ * checked against the canonical Unitree rev1 MJCF at CMake configure time.
+ * They are not training-time soft limits and carry no implicit margin.
  */
-inline constexpr std::array<double, G1_NUM_MOTOR> G1_JOINT_POSITION_LOWER_LIMITS = {
-    -2.5307, -0.5236, -2.7576, -0.087267, -0.87267, -0.2618,
-    -2.5307, -2.9671, -2.7576, -0.087267, -0.87267, -0.2618,
-    -2.618, -0.52, -0.52,
-    -3.0892, -1.5882, -2.618, -1.0472, -1.97222, -1.61443, -1.61443,
-    -3.0892, -2.2515, -2.618, -1.0472, -1.97222, -1.61443, -1.61443,
-};
-
-inline constexpr std::array<double, G1_NUM_MOTOR> G1_JOINT_POSITION_UPPER_LIMITS = {
-    2.8798, 2.9671, 2.7576, 2.8798, 0.5236, 0.2618,
-    2.8798, 0.5236, 2.7576, 2.8798, 0.5236, 0.2618,
-    2.618, 0.52, 0.52,
-    2.6704, 2.2515, 2.618, 2.0944, 1.97222, 1.61443, 1.61443,
-    2.6704, 1.5882, 2.618, 2.0944, 1.97222, 1.61443, 1.61443,
-};
+inline constexpr auto G1_JOINT_POSITION_LOWER_LIMITS =
+    sonic::mode5_contract::kPositionLower;
+inline constexpr auto G1_JOINT_POSITION_UPPER_LIMITS =
+    sonic::mode5_contract::kPositionUpper;
+inline constexpr auto G1_JOINT_VELOCITY_LIMITS =
+    sonic::mode5_contract::kPlantVelocityLimit;
+inline constexpr auto G1_JOINT_EFFORT_LIMITS =
+    sonic::mode5_contract::kPlantEffortLimit;
 
 constexpr bool G1JointPositionLimitsAreValid() {
   for (int i = 0; i < G1_NUM_MOTOR; ++i) {

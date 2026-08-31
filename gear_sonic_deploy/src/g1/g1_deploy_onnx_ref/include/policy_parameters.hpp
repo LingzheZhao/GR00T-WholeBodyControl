@@ -1,68 +1,32 @@
 /**
  * @file policy_parameters.hpp
- * @brief Motor constants, PID gains, joint mappings, action scales, and default
- *        standing angles for the G1 29-DOF policy.
+ * @brief Compatibility aliases for the generated G1 deployment contract.
  *
  * ## Joint Ordering
  *
  * Two ordering conventions coexist in the codebase:
- *  - **MuJoCo order** – used by the simulator, reference motions, and output
- *    interfaces.  Joint indices follow the URDF kinematic tree.
- *  - **IsaacLab order** – used internally by the RL policy and the robot SDK.
- *    Interleaves left/right joints differently.
+ *  - **MuJoCo / hardware order** – used by the simulator, LowState / LowCmd,
+ *    and output interfaces.  Joint indices follow the URDF kinematic tree.
+ *  - **IsaacLab / policy order** – used by the released RL policy and by the
+ *    reference-motion CSV/ZMQ wire columns.  It interleaves left/right joints
+ *    differently from MuJoCo / hardware order.
  *
  * The arrays `isaaclab_to_mujoco` and `mujoco_to_isaaclab` provide the
  * remapping between the two orderings.
  *
- * ## PID Gain Computation
- *
- * Stiffness (Kp) and damping (Kd) values are computed from motor armature
- * constants using a second-order critically-damped model:
- *   - stiffness = armature × ω²   (ω = 10 Hz × 2π)
- *   - damping   = 2 × ζ × armature × ω   (ζ = 2.0)
- *
- * ## Action Scaling
- *
- * Policy actions are scaled by:
- *   action_scale = 0.25 × effort_limit / stiffness
- *
- * The final joint target is: target = action × action_scale + default_angle.
+ * Gains, action scales, maps, signs, offsets and the default pose come only
+ * from mode5_contract_generated.hpp.  In particular the released policy's
+ * Mode-11-trained hip-pitch gains/scales stay bit-identical while the physical
+ * plant row honestly records the Mode-5 7520_14 actuator and 88 N-m ceiling.
  */
 
 #ifndef POLICY_PARAMETERS_HPP
 #define POLICY_PARAMETERS_HPP
 
 #include <array>
+#include <vector>
 
-const double ONE_DEGREE = 0.0174533;  ///< One degree in radians.
-
-// Motor armature constants (used for PID gain computation)
-const double ARMATURE_5020 = 0.003609725;
-const double ARMATURE_7520_14 = 0.010177520;
-const double ARMATURE_7520_22 = 0.025101925;
-const double ARMATURE_4010 = 0.00425;
-
-// Control parameters for PID gain computation
-const double NATURAL_FREQ = 10 * 2.0 * 3.1415926535; // 10Hz
-const double DAMPING_RATIO = 2;
-
-// Computed stiffness values: stiffness = armature * natural_freq^2
-const double STIFFNESS_5020 = ARMATURE_5020 * NATURAL_FREQ * NATURAL_FREQ;
-const double STIFFNESS_7520_14 = ARMATURE_7520_14 * NATURAL_FREQ * NATURAL_FREQ;
-const double STIFFNESS_7520_22 = ARMATURE_7520_22 * NATURAL_FREQ * NATURAL_FREQ;
-const double STIFFNESS_4010 = ARMATURE_4010 * NATURAL_FREQ * NATURAL_FREQ;
-
-// Computed damping values: damping = 2.0 * damping_ratio * armature * natural_freq
-const double DAMPING_5020 = 2.0 * DAMPING_RATIO * ARMATURE_5020 * NATURAL_FREQ;
-const double DAMPING_7520_14 = 2.0 * DAMPING_RATIO * ARMATURE_7520_14 * NATURAL_FREQ;
-const double DAMPING_7520_22 = 2.0 * DAMPING_RATIO * ARMATURE_7520_22 * NATURAL_FREQ;
-const double DAMPING_4010 = 2.0 * DAMPING_RATIO * ARMATURE_4010 * NATURAL_FREQ;
-
-// Effort limits for different motor types (used for action scale computation)
-const double EFFORT_LIMIT_5020 = 25.0;    // 5020 motor type
-const double EFFORT_LIMIT_7520_14 = 88.0; // 7520_14 motor type
-const double EFFORT_LIMIT_7520_22 = 139.0; // 7520_22 motor type
-const double EFFORT_LIMIT_4010 = 5.0;     // 4010 motor type
+#include "mode5_contract_generated.hpp"
 
 
 // VR5Point index (isaaclab index) left wrist, right wrist, pelvs, left ankle, right ankle
@@ -96,147 +60,18 @@ const std::vector<int> lower_body_joint_mujoco_order_in_mujoco_index = {0, 1, 2,
 const std::vector<int> lower_body_joint_isaaclab_order_in_isaaclab_index = {0, 1, 3, 4, 6, 7, 9, 10, 13, 14, 17, 18};
 const std::vector<int> lower_body_joint_isaaclab_order_in_mujoco_index = {0, 6, 1, 7, 2, 8, 3, 9, 4, 10, 5, 11};
 
-// Joint mapping arrays (mujoco order in isaaclab index)
-const std::array<int, 29> isaaclab_to_mujoco = {0,  3,  6,  9,  13, 17, 1,  4,  7,  10, 14, 18, 2,  5, 8,
-                                                11, 15, 19, 21, 23, 25, 27, 12, 16, 20, 22, 24, 26, 28};
-// Joint mapping arrays  (isaaclab order in mujoco index)
-const std::array<int, 29> mujoco_to_isaaclab = {0,  6,  12, 1,  7,  13, 2,  8,  14, 3,  9,  15, 22, 4, 10,
-                                                16, 23, 5,  11, 17, 24, 18, 25, 19, 26, 20, 27, 21, 28};
-
-// Action scaling parameters
-// Computed using: action_scale = 0.25 * effort_limit / stiffness
-// Based on actuator configurations from IsaacLab G1_CYLINDER_CFG
-const std::array<double, 29> g1_action_scale = {
-    0.25 * EFFORT_LIMIT_7520_22 / STIFFNESS_7520_22, // left_hip_pitch_joint （old is 7520_14 new is 7520_22）
-    0.25 * EFFORT_LIMIT_7520_22 / STIFFNESS_7520_22, // left_hip_roll_joint
-    0.25 * EFFORT_LIMIT_7520_14 / STIFFNESS_7520_14, // left_hip_yaw_joint
-    0.25 * EFFORT_LIMIT_7520_22 / STIFFNESS_7520_22, // left_knee_joint
-    0.25 * EFFORT_LIMIT_5020 / STIFFNESS_5020, // left_ankle_pitch_joint
-    0.25 * EFFORT_LIMIT_5020 / STIFFNESS_5020, // left_ankle_roll_joint
-    0.25 * EFFORT_LIMIT_7520_22 / STIFFNESS_7520_22, // right_hip_pitch_joint (old is 7520_14 new is 7520_22）
-    0.25 * EFFORT_LIMIT_7520_22 / STIFFNESS_7520_22, // right_hip_roll_joint
-    0.25 * EFFORT_LIMIT_7520_14 / STIFFNESS_7520_14, // right_hip_yaw_joint
-    0.25 * EFFORT_LIMIT_7520_22 / STIFFNESS_7520_22, // right_knee_joint
-    0.25 * EFFORT_LIMIT_5020 / STIFFNESS_5020, // right_ankle_pitch_joint
-    0.25 * EFFORT_LIMIT_5020 / STIFFNESS_5020, // right_ankle_roll_joint
-    0.25 * EFFORT_LIMIT_7520_14 / STIFFNESS_7520_14, // waist_yaw_joint
-    0.25 * EFFORT_LIMIT_5020 / STIFFNESS_5020, // waist_roll_joint
-    0.25 * EFFORT_LIMIT_5020 / STIFFNESS_5020, // waist_pitch_joint
-    0.25 * EFFORT_LIMIT_5020 / STIFFNESS_5020, // left_shoulder_pitch_joint
-    0.25 * EFFORT_LIMIT_5020 / STIFFNESS_5020, // left_shoulder_roll_joint
-    0.25 * EFFORT_LIMIT_5020 / STIFFNESS_5020, // left_shoulder_yaw_joint
-    0.25 * EFFORT_LIMIT_5020 / STIFFNESS_5020, // left_elbow_joint
-    0.25 * EFFORT_LIMIT_5020 / STIFFNESS_5020, // left_wrist_roll_joint
-    0.25 * EFFORT_LIMIT_4010 / STIFFNESS_4010, // left_wrist_pitch_joint
-    0.25 * EFFORT_LIMIT_4010 / STIFFNESS_4010, // left_wrist_yaw_joint
-    0.25 * EFFORT_LIMIT_5020 / STIFFNESS_5020, // right_shoulder_pitch_joint
-    0.25 * EFFORT_LIMIT_5020 / STIFFNESS_5020, // right_shoulder_roll_joint
-    0.25 * EFFORT_LIMIT_5020 / STIFFNESS_5020, // right_shoulder_yaw_joint
-    0.25 * EFFORT_LIMIT_5020 / STIFFNESS_5020, // right_elbow_joint
-    0.25 * EFFORT_LIMIT_5020 / STIFFNESS_5020, // right_wrist_roll_joint
-    0.25 * EFFORT_LIMIT_4010 / STIFFNESS_4010, // right_wrist_pitch_joint
-    0.25 * EFFORT_LIMIT_4010 / STIFFNESS_4010, // right_wrist_yaw_joint
-};
-
-// PID control gains - Position gains (Kp)
-// These values are computed based on the stiffness constants above
-const std::array<float, 29> kps = {
-    STIFFNESS_7520_22, // left_hip_pitch_joint (old is 7520_14 new is 7520_22）
-    STIFFNESS_7520_22, // left_hip_roll_joint
-    STIFFNESS_7520_14, // left_hip_yaw_joint
-    STIFFNESS_7520_22, // left_knee_joint
-    2.0 * STIFFNESS_5020, // left_ankle_pitch_joint
-    2.0 * STIFFNESS_5020, // left_ankle_roll_joint
-    STIFFNESS_7520_22, // right_hip_pitch_joint (old is 7520_14 new is 7520_22）
-    STIFFNESS_7520_22, // right_hip_roll_joint
-    STIFFNESS_7520_14, // right_hip_yaw_joint
-    STIFFNESS_7520_22, // right_knee_joint
-    2.0 * STIFFNESS_5020, // right_ankle_pitch_joint
-    2.0 * STIFFNESS_5020, // right_ankle_roll_joint
-    STIFFNESS_7520_14, // waist_yaw_joint
-    2.0 * STIFFNESS_5020, // waist_roll_joint
-    2.0 * STIFFNESS_5020, // waist_pitch_joint
-    STIFFNESS_5020, // left_shoulder_pitch_joint
-    STIFFNESS_5020, // left_shoulder_roll_joint
-    STIFFNESS_5020, // left_shoulder_yaw_joint
-    STIFFNESS_5020, // left_elbow_joint
-    STIFFNESS_5020, // left_wrist_roll_joint
-    STIFFNESS_4010, // left_wrist_pitch_joint
-    STIFFNESS_4010, // left_wrist_yaw_joint
-    STIFFNESS_5020, // right_shoulder_pitch_joint
-    STIFFNESS_5020, // right_shoulder_roll_joint
-    STIFFNESS_5020, // right_shoulder_yaw_joint
-    STIFFNESS_5020, // right_elbow_joint
-    STIFFNESS_5020, // right_wrist_roll_joint
-    STIFFNESS_4010, // right_wrist_pitch_joint
-    STIFFNESS_4010, // right_wrist_yaw_joint
-};
-
-// PID control gains - Derivative gains (Kd)
-// These values are computed based on the damping constants above
-const std::array<float, 29> kds = {
-    DAMPING_7520_22, // left_hip_pitch_joint (old is 7520_14 new is 7520_22）
-    DAMPING_7520_22, // left_hip_roll_joint
-    DAMPING_7520_14, // left_hip_yaw_joint
-    DAMPING_7520_22, // left_knee_joint
-    2.0 * DAMPING_5020, // left_ankle_pitch_joint
-    2.0 * DAMPING_5020, // left_ankle_roll_joint
-    DAMPING_7520_22, // right_hip_pitch_joint (old is 7520_14 new is 7520_22）
-    DAMPING_7520_22, // right_hip_roll_joint
-    DAMPING_7520_14, // right_hip_yaw_joint
-    DAMPING_7520_22, // right_knee_joint
-    2.0 * DAMPING_5020, // right_ankle_pitch_joint
-    2.0 * DAMPING_5020, // right_ankle_roll_joint
-    DAMPING_7520_14, // waist_yaw_joint
-    2.0 * DAMPING_5020, // waist_roll_joint
-    2.0 * DAMPING_5020, // waist_pitch_joint
-    DAMPING_5020, // left_shoulder_pitch_joint
-    DAMPING_5020, // left_shoulder_roll_joint
-    DAMPING_5020, // left_shoulder_yaw_joint
-    DAMPING_5020, // left_elbow_joint
-    DAMPING_5020, // left_wrist_roll_joint
-    DAMPING_4010, // left_wrist_pitch_joint
-    DAMPING_4010, // left_wrist_yaw_joint
-    DAMPING_5020, // right_shoulder_pitch_joint
-    DAMPING_5020, // right_shoulder_roll_joint
-    DAMPING_5020, // right_shoulder_yaw_joint
-    DAMPING_5020, // right_elbow_joint
-    DAMPING_5020, // right_wrist_roll_joint
-    DAMPING_4010, // right_wrist_pitch_joint
-    DAMPING_4010, // right_wrist_yaw_joint
-};
-
-// Default joint angles (standing pose)
-const std::array<double, 29> default_angles = {
-    -0.312, // left_hip_pitch_joint
-    0.0, // left_hip_roll_joint
-    0.0, // left_hip_yaw_joint
-    0.669, // left_knee_joint
-    -0.363, // left_ankle_pitch_joint
-    0.0, // left_ankle_roll_joint
-    -0.312, // right_hip_pitch_joint
-    0.0, // right_hip_roll_joint
-    0.0, // right_hip_yaw_joint
-    0.669, // right_knee_joint
-    -0.363, // right_ankle_pitch_joint
-    0.0, // right_ankle_roll_joint
-    0.0, // waist_yaw_joint
-    0.0, // waist_roll_joint
-    0.0, // waist_pitch_joint
-    0.2, // left_shoulder_pitch_joint
-    0.2, // left_shoulder_roll_joint
-    0.0, // left_shoulder_yaw_joint
-    0.6, // left_elbow_joint
-    0.0, // left_wrist_roll_joint
-    0.0, // left_wrist_pitch_joint
-    0.0, // left_wrist_yaw_joint
-    0.2, // right_shoulder_pitch_joint
-    -0.2, // right_shoulder_roll_joint
-    0.0, // right_shoulder_yaw_joint
-    0.6, // right_elbow_joint
-    0.0, // right_wrist_roll_joint
-    0.0, // right_wrist_pitch_joint
-    0.0 // right_wrist_yaw_joint
-};
+// Historical names retained for source compatibility.  Both mappings and all
+// command parameters are generated from the reviewed JSON contract.
+inline constexpr auto isaaclab_to_mujoco =
+    sonic::mode5_contract::kMujocoOrderInIsaaclabIndex;
+inline constexpr auto mujoco_to_isaaclab =
+    sonic::mode5_contract::kIsaaclabOrderInMujocoIndex;
+inline constexpr auto command_sign = sonic::mode5_contract::kCommandSign;
+inline constexpr auto command_offset = sonic::mode5_contract::kCommandOffset;
+inline constexpr auto g1_action_scale =
+    sonic::mode5_contract::kPolicyActionScale;
+inline constexpr auto kps = sonic::mode5_contract::kPolicyKp;
+inline constexpr auto kds = sonic::mode5_contract::kPolicyKd;
+inline constexpr auto default_angles = sonic::mode5_contract::kDefaultAngles;
 
 #endif // POLICY_PARAMETERS_HPP

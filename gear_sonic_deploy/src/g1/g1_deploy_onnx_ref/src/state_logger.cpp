@@ -172,9 +172,11 @@ bool StateLogger::LogPostState(const std::span<double>& token_state, int encoder
 }
 
 bool StateLogger::LogCommandTargets(std::span<const double> raw_q_des,
-                                    std::span<const double> executed_q_des) {
-  if (raw_q_des.empty() || raw_q_des.size() != executed_q_des.size()) {
-    std::cerr << "[StateLogger ERROR] Command target vectors must be non-empty and have equal dimensions."
+                                    std::span<const double> executed_q_des,
+                                    std::span<const double> previous_executed_q_des) {
+  if (raw_q_des.empty() || raw_q_des.size() != executed_q_des.size() ||
+      raw_q_des.size() != previous_executed_q_des.size()) {
+    std::cerr << "[StateLogger ERROR] Current and previous command target vectors must be non-empty and have equal dimensions."
               << std::endl;
     return false;
   }
@@ -203,6 +205,8 @@ bool StateLogger::LogCommandTargets(std::span<const double> raw_q_des,
 
   newest.raw_q_des.assign(raw_q_des.begin(), raw_q_des.end());
   newest.executed_q_des.assign(executed_q_des.begin(), executed_q_des.end());
+  newest.previous_executed_q_des.assign(previous_executed_q_des.begin(),
+                                        previous_executed_q_des.end());
   newest.has_command_targets = true;
   return true;
 }
@@ -530,6 +534,7 @@ Entry StateLogger::makeZeroEntry_() const {
   e.has_command_targets = false;
   e.raw_q_des.clear();
   e.executed_q_des.clear();
+  e.previous_executed_q_des.clear();
   // Hand data (7 motors each)
   e.left_hand_q.assign(7, 0.0);
   e.left_hand_dq.assign(7, 0.0);

@@ -1,0 +1,158 @@
+{
+  "schema": "motionlcm.g1.deployment-contract.v1",
+  "profile_id": "sonic-g1-mode5-derived-v1",
+  "contract_revision": 3,
+  "status": "experimental-cross-revision",
+  "vendor_attested": false,
+  "compatibility_basis": "released-mode11-policy-semantics-on-mode5-physical-plant",
+  "sources": {
+    "unitree_model": {
+      "repository": "unitreerobotics/unitree_ros",
+      "revision": "daadf41ee9afce8f90fdc09a98506012691fa122",
+      "path": "robots/g1_description/g1_29dof_rev_1_0.xml",
+      "sha256": "165fa7a5275745e45fa25e1bc78010c1055d81bb81c013b3c7bc8b9347a3b9c3"
+    },
+    "unitree_actuator": {
+      "repository": "unitreerobotics/unitree_rl_mjlab",
+      "revision": "1425b15f73bd4095f0df53709d7c389c3eb9e790",
+      "path": "src/assets/robots/unitree_g1/g1_constants.py",
+      "sha256": "136b59af97082a74fd3a2a4250bc2e290b3ba6a26533b1492be52114dd844c5d"
+    },
+    "unitree_takeover_control": {
+      "repository": "unitreerobotics/unitree_sdk2",
+      "revision": "9754cd153af3da471b0fe5f3aa535e426fb11db3",
+      "path": "example/g1/low_level/g1_ankle_swing_example.cpp",
+      "sha256": "9394824751ee4f74d252546fe4f3c20145f9148becfbb9eeb53cbeef449c6b8b"
+    }
+  },
+  "policy_transfer": {
+    "checkpoint_training_mode_machine": 11,
+    "physical_plant_mode_machine": 5,
+    "parameter_semantics": "released-mode11-policy-values-preserved-bit-exact",
+    "hip_pitch_policy_gain_basis": "7520_22-mode11",
+    "hip_pitch_physical_actuator": "7520_14",
+    "hip_pitch_physical_effort_limit_nm": 88.0
+  },
+  "checkpoint": {
+    "source": "nvidia/GEAR-SONIC",
+    "revision": "9c0ff22b4ffec27c5392e8e284eb2f2df7a5b4e2",
+    "files": [
+      {
+        "path": "policy/release/model_decoder.onnx",
+        "size": 40900688,
+        "sha256": "c7241a123eaa36b5d64bad19540efde93cac1ad443bd4572fd12ca99898118ed"
+      },
+      {
+        "path": "policy/release/model_encoder.onnx",
+        "size": 50100513,
+        "sha256": "013ab0287236aa2721e13f1e936d699db982302d0de0bfcdae76d5c3245362d3"
+      },
+      {
+        "path": "policy/release/observation_config.yaml",
+        "size": 2336,
+        "sha256": "466d05947c78af6c76388adfb86e3a2a77b2a1d921a64883ed3d085ebf58de1b"
+      }
+    ]
+  },
+  "joint_conventions": {
+    "position_unit": "radian",
+    "velocity_unit": "radian_per_second",
+    "torque_unit": "newton_meter",
+    "policy_to_hardware_target": "q_lowcmd[h]=default_angle_rad[h]+command_offset_rad[h]+command_sign[h]*policy_action_scale_rad[h]*action[policy_isaaclab_index[h]]",
+    "hardware_to_policy_position": "q_policy[p]=command_sign[h]*(q_lowstate[h]-default_angle_rad[h]-command_offset_rad[h]),p=policy_isaaclab_index[h]",
+    "hardware_to_policy_velocity": "dq_policy[p]=command_sign[h]*dq_lowstate[h],p=policy_isaaclab_index[h]",
+    "policy_to_fk": "q_mjcf[h]=command_sign[h]*q_policy_absolute[policy_isaaclab_index[h]]+command_offset_rad[h]"
+  },
+  "joint_parameter_sha256": "8c46e85155070a359dce3059a86a98b0c7cd8d8b1ba3079e2f4d97a13236237b",
+  "lowcmd": {
+    "mode_machine": 5,
+    "mode_pr": 0,
+    "active_motor_count": 29,
+    "motor_mode": 1,
+    "writer_rate_hz": 500
+  },
+  "simulation_timing": {
+    "physics_timestep_seconds": 0.002,
+    "physics_rate_hz": 500,
+    "physics_steps_per_lowcmd_period": 1,
+    "torque_application": "external-pd-recomputed-once-per-mujoco-step"
+  },
+  "measured_state_safety": {
+    "position_limit_tolerance_rad": 0.0,
+    "velocity_limit_tolerance_rad_s": 0.0
+  },
+  "takeover_control": {
+    "duration_seconds": 3.0,
+    "semantics": "fixed-duration-linear-position-ramp-and-idle-hold",
+    "source_role": "official-g1-low-level-init-and-idle-gain-schedule"
+  },
+  "shutdown_damping": {
+    "q_rad": 0.0,
+    "dq_rad_s": 0.0,
+    "kp_nm_per_rad": 0.0,
+    "kd_nm_s_per_rad": 8.0,
+    "tau_ff_nm": 0.0,
+    "repeat_ms": 250
+  },
+  "models": {
+    "fk_mjcf": {
+      "path_from_wbc_root": "gear_sonic/data/assets/robot_description/mjcf/g1_29dof_rev_1_0.xml",
+      "size": 36030,
+      "sha256": "15a330f1dbff68cdbeb8284be6162a857bdcd21a858f65a8617fb32d5115f209",
+      "role": "canonical-mode5-fk-and-hard-position-limits"
+    },
+    "sim_mjcf": {
+      "path_from_wbc_root": "decoupled_wbc/control/robot_model/model_data/g1/g1_29dof_with_hand_rev_1_0_activatedfinger.xml",
+      "size": 45258,
+      "sha256": "388d682c8ed36e833eca986109fdca2797c4d5f3882822e2b03a1af1a2675f07",
+      "role": "mode5-native-mujoco-with-dex3-extension"
+    },
+    "sim_scene": {
+      "path_from_wbc_root": "decoupled_wbc/control/robot_model/model_data/g1/scene_29dof_activated3dex.xml",
+      "size": 1169,
+      "sha256": "88a24971e125eb20382e59217a18ee97eb0756c3e450e29a95a9e34ef397fbfc",
+      "role": "mode5-native-mujoco-scene-floor-friction-and-options"
+    },
+    "sim_config": {
+      "path_from_wbc_root": "gear_sonic/utils/mujoco_sim/wbc_configs/g1_29dof_sonic_model12.yaml",
+      "size": 12448,
+      "sha256": "15520caa4b5748fab451f7f34661646bfb9db9dbd06fd8ed240f507f629d01a6",
+      "role": "base-wbc-config-overridden-to-mode5-scene-by-sim-profile"
+    },
+    "sim_scene_include": "g1_29dof_with_hand_rev_1_0_activatedfinger.xml",
+    "sim_config_scene_override": "decoupled_wbc/control/robot_model/model_data/g1/scene_29dof_activated3dex.xml",
+    "common_kinematics_sha256": "4b4272979a730962981652897f5035d02abbab9db4197dd29320266f564ffdc5",
+    "common_29dof_kinematics_sha256": "4b4272979a730962981652897f5035d02abbab9db4197dd29320266f564ffdc5"
+  },
+  "joints": [
+    {"index": 0, "name": "left_hip_pitch_joint", "policy_isaaclab_index": 0, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -2.5307, "position_upper_rad": 2.8798, "physical_actuator": "7520_14", "plant_effort_limit_nm": 88.0, "plant_velocity_limit_rad_s": 32.0, "plant_armature_kg_m2": 0.01017752, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.2, "takeover_kp_nm_per_rad": 60.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "7520_22-mode11", "policy_kp_nm_per_rad": 99.09842777666113, "policy_kd_nm_s_per_rad": 6.3088018534966395, "policy_action_scale_rad": 0.3506614663788243, "default_angle_rad": -0.312},
+    {"index": 1, "name": "left_hip_roll_joint", "policy_isaaclab_index": 3, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -0.5236, "position_upper_rad": 2.9671, "physical_actuator": "7520_22", "plant_effort_limit_nm": 139.0, "plant_velocity_limit_rad_s": 20.0, "plant_armature_kg_m2": 0.025101925, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.2, "takeover_kp_nm_per_rad": 60.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "7520_22", "policy_kp_nm_per_rad": 99.09842777666113, "policy_kd_nm_s_per_rad": 6.3088018534966395, "policy_action_scale_rad": 0.3506614663788243, "default_angle_rad": 0},
+    {"index": 2, "name": "left_hip_yaw_joint", "policy_isaaclab_index": 6, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -2.7576, "position_upper_rad": 2.7576, "physical_actuator": "7520_14", "plant_effort_limit_nm": 88.0, "plant_velocity_limit_rad_s": 32.0, "plant_armature_kg_m2": 0.01017752, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.2, "takeover_kp_nm_per_rad": 60.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "7520_14", "policy_kp_nm_per_rad": 40.179238471373175, "policy_kd_nm_s_per_rad": 2.5578897650279457, "policy_action_scale_rad": 0.5475464652142304, "default_angle_rad": 0},
+    {"index": 3, "name": "left_knee_joint", "policy_isaaclab_index": 9, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -0.087267, "position_upper_rad": 2.8798, "physical_actuator": "7520_22", "plant_effort_limit_nm": 139.0, "plant_velocity_limit_rad_s": 20.0, "plant_armature_kg_m2": 0.025101925, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.2, "takeover_kp_nm_per_rad": 100.0, "takeover_kd_nm_s_per_rad": 2.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "7520_22", "policy_kp_nm_per_rad": 99.09842777666113, "policy_kd_nm_s_per_rad": 6.3088018534966395, "policy_action_scale_rad": 0.3506614663788243, "default_angle_rad": 0.669},
+    {"index": 4, "name": "left_ankle_pitch_joint", "policy_isaaclab_index": 13, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -0.87267, "position_upper_rad": 0.5236, "physical_actuator": "5020x2", "plant_effort_limit_nm": 50.0, "plant_velocity_limit_rad_s": 37.0, "plant_armature_kg_m2": 0.00721945, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.2, "takeover_kp_nm_per_rad": 40.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "5020x2", "policy_kp_nm_per_rad": 28.50124619574858, "policy_kd_nm_s_per_rad": 1.814445686584846, "policy_action_scale_rad": 0.43857731392336724, "default_angle_rad": -0.363},
+    {"index": 5, "name": "left_ankle_roll_joint", "policy_isaaclab_index": 17, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -0.2618, "position_upper_rad": 0.2618, "physical_actuator": "5020x2", "plant_effort_limit_nm": 50.0, "plant_velocity_limit_rad_s": 37.0, "plant_armature_kg_m2": 0.00721945, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.2, "takeover_kp_nm_per_rad": 40.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "5020x2", "policy_kp_nm_per_rad": 28.50124619574858, "policy_kd_nm_s_per_rad": 1.814445686584846, "policy_action_scale_rad": 0.43857731392336724, "default_angle_rad": 0},
+    {"index": 6, "name": "right_hip_pitch_joint", "policy_isaaclab_index": 1, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -2.5307, "position_upper_rad": 2.8798, "physical_actuator": "7520_14", "plant_effort_limit_nm": 88.0, "plant_velocity_limit_rad_s": 32.0, "plant_armature_kg_m2": 0.01017752, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.2, "takeover_kp_nm_per_rad": 60.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "7520_22-mode11", "policy_kp_nm_per_rad": 99.09842777666113, "policy_kd_nm_s_per_rad": 6.3088018534966395, "policy_action_scale_rad": 0.3506614663788243, "default_angle_rad": -0.312},
+    {"index": 7, "name": "right_hip_roll_joint", "policy_isaaclab_index": 4, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -2.9671, "position_upper_rad": 0.5236, "physical_actuator": "7520_22", "plant_effort_limit_nm": 139.0, "plant_velocity_limit_rad_s": 20.0, "plant_armature_kg_m2": 0.025101925, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.2, "takeover_kp_nm_per_rad": 60.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "7520_22", "policy_kp_nm_per_rad": 99.09842777666113, "policy_kd_nm_s_per_rad": 6.3088018534966395, "policy_action_scale_rad": 0.3506614663788243, "default_angle_rad": 0},
+    {"index": 8, "name": "right_hip_yaw_joint", "policy_isaaclab_index": 7, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -2.7576, "position_upper_rad": 2.7576, "physical_actuator": "7520_14", "plant_effort_limit_nm": 88.0, "plant_velocity_limit_rad_s": 32.0, "plant_armature_kg_m2": 0.01017752, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.2, "takeover_kp_nm_per_rad": 60.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "7520_14", "policy_kp_nm_per_rad": 40.179238471373175, "policy_kd_nm_s_per_rad": 2.5578897650279457, "policy_action_scale_rad": 0.5475464652142304, "default_angle_rad": 0},
+    {"index": 9, "name": "right_knee_joint", "policy_isaaclab_index": 10, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -0.087267, "position_upper_rad": 2.8798, "physical_actuator": "7520_22", "plant_effort_limit_nm": 139.0, "plant_velocity_limit_rad_s": 20.0, "plant_armature_kg_m2": 0.025101925, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.2, "takeover_kp_nm_per_rad": 100.0, "takeover_kd_nm_s_per_rad": 2.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "7520_22", "policy_kp_nm_per_rad": 99.09842777666113, "policy_kd_nm_s_per_rad": 6.3088018534966395, "policy_action_scale_rad": 0.3506614663788243, "default_angle_rad": 0.669},
+    {"index": 10, "name": "right_ankle_pitch_joint", "policy_isaaclab_index": 14, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -0.87267, "position_upper_rad": 0.5236, "physical_actuator": "5020x2", "plant_effort_limit_nm": 50.0, "plant_velocity_limit_rad_s": 37.0, "plant_armature_kg_m2": 0.00721945, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.2, "takeover_kp_nm_per_rad": 40.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "5020x2", "policy_kp_nm_per_rad": 28.50124619574858, "policy_kd_nm_s_per_rad": 1.814445686584846, "policy_action_scale_rad": 0.43857731392336724, "default_angle_rad": -0.363},
+    {"index": 11, "name": "right_ankle_roll_joint", "policy_isaaclab_index": 18, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -0.2618, "position_upper_rad": 0.2618, "physical_actuator": "5020x2", "plant_effort_limit_nm": 50.0, "plant_velocity_limit_rad_s": 37.0, "plant_armature_kg_m2": 0.00721945, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.2, "takeover_kp_nm_per_rad": 40.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "5020x2", "policy_kp_nm_per_rad": 28.50124619574858, "policy_kd_nm_s_per_rad": 1.814445686584846, "policy_action_scale_rad": 0.43857731392336724, "default_angle_rad": 0},
+    {"index": 12, "name": "waist_yaw_joint", "policy_isaaclab_index": 2, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -2.618, "position_upper_rad": 2.618, "physical_actuator": "7520_14", "plant_effort_limit_nm": 88.0, "plant_velocity_limit_rad_s": 32.0, "plant_armature_kg_m2": 0.01017752, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.2, "takeover_kp_nm_per_rad": 60.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "7520_14", "policy_kp_nm_per_rad": 40.179238471373175, "policy_kd_nm_s_per_rad": 2.5578897650279457, "policy_action_scale_rad": 0.5475464652142304, "default_angle_rad": 0},
+    {"index": 13, "name": "waist_roll_joint", "policy_isaaclab_index": 5, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -0.52, "position_upper_rad": 0.52, "physical_actuator": "5020x2", "plant_effort_limit_nm": 50.0, "plant_velocity_limit_rad_s": 37.0, "plant_armature_kg_m2": 0.00721945, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.2, "takeover_kp_nm_per_rad": 40.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "5020x2", "policy_kp_nm_per_rad": 28.50124619574858, "policy_kd_nm_s_per_rad": 1.814445686584846, "policy_action_scale_rad": 0.43857731392336724, "default_angle_rad": 0},
+    {"index": 14, "name": "waist_pitch_joint", "policy_isaaclab_index": 8, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -0.52, "position_upper_rad": 0.52, "physical_actuator": "5020x2", "plant_effort_limit_nm": 50.0, "plant_velocity_limit_rad_s": 37.0, "plant_armature_kg_m2": 0.00721945, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.2, "takeover_kp_nm_per_rad": 40.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "5020x2", "policy_kp_nm_per_rad": 28.50124619574858, "policy_kd_nm_s_per_rad": 1.814445686584846, "policy_action_scale_rad": 0.43857731392336724, "default_angle_rad": 0},
+    {"index": 15, "name": "left_shoulder_pitch_joint", "policy_isaaclab_index": 11, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -3.0892, "position_upper_rad": 2.6704, "physical_actuator": "5020", "plant_effort_limit_nm": 25.0, "plant_velocity_limit_rad_s": 37.0, "plant_armature_kg_m2": 0.003609725, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.2, "takeover_kp_nm_per_rad": 40.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "5020", "policy_kp_nm_per_rad": 14.25062309787429, "policy_kd_nm_s_per_rad": 0.907222843292423, "policy_action_scale_rad": 0.43857731392336724, "default_angle_rad": 0.2},
+    {"index": 16, "name": "left_shoulder_roll_joint", "policy_isaaclab_index": 15, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -1.5882, "position_upper_rad": 2.2515, "physical_actuator": "5020", "plant_effort_limit_nm": 25.0, "plant_velocity_limit_rad_s": 37.0, "plant_armature_kg_m2": 0.003609725, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.2, "takeover_kp_nm_per_rad": 40.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "5020", "policy_kp_nm_per_rad": 14.25062309787429, "policy_kd_nm_s_per_rad": 0.907222843292423, "policy_action_scale_rad": 0.43857731392336724, "default_angle_rad": 0.2},
+    {"index": 17, "name": "left_shoulder_yaw_joint", "policy_isaaclab_index": 19, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -2.618, "position_upper_rad": 2.618, "physical_actuator": "5020", "plant_effort_limit_nm": 25.0, "plant_velocity_limit_rad_s": 37.0, "plant_armature_kg_m2": 0.003609725, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.2, "takeover_kp_nm_per_rad": 40.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "5020", "policy_kp_nm_per_rad": 14.25062309787429, "policy_kd_nm_s_per_rad": 0.907222843292423, "policy_action_scale_rad": 0.43857731392336724, "default_angle_rad": 0},
+    {"index": 18, "name": "left_elbow_joint", "policy_isaaclab_index": 21, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -1.0472, "position_upper_rad": 2.0944, "physical_actuator": "5020", "plant_effort_limit_nm": 25.0, "plant_velocity_limit_rad_s": 37.0, "plant_armature_kg_m2": 0.003609725, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.2, "takeover_kp_nm_per_rad": 40.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "5020", "policy_kp_nm_per_rad": 14.25062309787429, "policy_kd_nm_s_per_rad": 0.907222843292423, "policy_action_scale_rad": 0.43857731392336724, "default_angle_rad": 0.6},
+    {"index": 19, "name": "left_wrist_roll_joint", "policy_isaaclab_index": 23, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -1.97222, "position_upper_rad": 1.97222, "physical_actuator": "5020", "plant_effort_limit_nm": 25.0, "plant_velocity_limit_rad_s": 37.0, "plant_armature_kg_m2": 0.003609725, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.1, "takeover_kp_nm_per_rad": 40.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "5020", "policy_kp_nm_per_rad": 14.25062309787429, "policy_kd_nm_s_per_rad": 0.907222843292423, "policy_action_scale_rad": 0.43857731392336724, "default_angle_rad": 0},
+    {"index": 20, "name": "left_wrist_pitch_joint", "policy_isaaclab_index": 25, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -1.61443, "position_upper_rad": 1.61443, "physical_actuator": "4010", "plant_effort_limit_nm": 5.0, "plant_velocity_limit_rad_s": 22.0, "plant_armature_kg_m2": 0.00425, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.1, "takeover_kp_nm_per_rad": 40.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "4010", "policy_kp_nm_per_rad": 16.77832748089279, "policy_kd_nm_s_per_rad": 1.06814150219, "policy_action_scale_rad": 0.07450087032950714, "default_angle_rad": 0},
+    {"index": 21, "name": "left_wrist_yaw_joint", "policy_isaaclab_index": 27, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -1.61443, "position_upper_rad": 1.61443, "physical_actuator": "4010", "plant_effort_limit_nm": 5.0, "plant_velocity_limit_rad_s": 22.0, "plant_armature_kg_m2": 0.00425, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.1, "takeover_kp_nm_per_rad": 40.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "4010", "policy_kp_nm_per_rad": 16.77832748089279, "policy_kd_nm_s_per_rad": 1.06814150219, "policy_action_scale_rad": 0.07450087032950714, "default_angle_rad": 0},
+    {"index": 22, "name": "right_shoulder_pitch_joint", "policy_isaaclab_index": 12, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -3.0892, "position_upper_rad": 2.6704, "physical_actuator": "5020", "plant_effort_limit_nm": 25.0, "plant_velocity_limit_rad_s": 37.0, "plant_armature_kg_m2": 0.003609725, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.2, "takeover_kp_nm_per_rad": 40.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "5020", "policy_kp_nm_per_rad": 14.25062309787429, "policy_kd_nm_s_per_rad": 0.907222843292423, "policy_action_scale_rad": 0.43857731392336724, "default_angle_rad": 0.2},
+    {"index": 23, "name": "right_shoulder_roll_joint", "policy_isaaclab_index": 16, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -2.2515, "position_upper_rad": 1.5882, "physical_actuator": "5020", "plant_effort_limit_nm": 25.0, "plant_velocity_limit_rad_s": 37.0, "plant_armature_kg_m2": 0.003609725, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.2, "takeover_kp_nm_per_rad": 40.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "5020", "policy_kp_nm_per_rad": 14.25062309787429, "policy_kd_nm_s_per_rad": 0.907222843292423, "policy_action_scale_rad": 0.43857731392336724, "default_angle_rad": -0.2},
+    {"index": 24, "name": "right_shoulder_yaw_joint", "policy_isaaclab_index": 20, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -2.618, "position_upper_rad": 2.618, "physical_actuator": "5020", "plant_effort_limit_nm": 25.0, "plant_velocity_limit_rad_s": 37.0, "plant_armature_kg_m2": 0.003609725, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.2, "takeover_kp_nm_per_rad": 40.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "5020", "policy_kp_nm_per_rad": 14.25062309787429, "policy_kd_nm_s_per_rad": 0.907222843292423, "policy_action_scale_rad": 0.43857731392336724, "default_angle_rad": 0},
+    {"index": 25, "name": "right_elbow_joint", "policy_isaaclab_index": 22, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -1.0472, "position_upper_rad": 2.0944, "physical_actuator": "5020", "plant_effort_limit_nm": 25.0, "plant_velocity_limit_rad_s": 37.0, "plant_armature_kg_m2": 0.003609725, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.2, "takeover_kp_nm_per_rad": 40.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "5020", "policy_kp_nm_per_rad": 14.25062309787429, "policy_kd_nm_s_per_rad": 0.907222843292423, "policy_action_scale_rad": 0.43857731392336724, "default_angle_rad": 0.6},
+    {"index": 26, "name": "right_wrist_roll_joint", "policy_isaaclab_index": 24, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -1.97222, "position_upper_rad": 1.97222, "physical_actuator": "5020", "plant_effort_limit_nm": 25.0, "plant_velocity_limit_rad_s": 37.0, "plant_armature_kg_m2": 0.003609725, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.1, "takeover_kp_nm_per_rad": 40.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "5020", "policy_kp_nm_per_rad": 14.25062309787429, "policy_kd_nm_s_per_rad": 0.907222843292423, "policy_action_scale_rad": 0.43857731392336724, "default_angle_rad": 0},
+    {"index": 27, "name": "right_wrist_pitch_joint", "policy_isaaclab_index": 26, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -1.61443, "position_upper_rad": 1.61443, "physical_actuator": "4010", "plant_effort_limit_nm": 5.0, "plant_velocity_limit_rad_s": 22.0, "plant_armature_kg_m2": 0.00425, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.1, "takeover_kp_nm_per_rad": 40.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "4010", "policy_kp_nm_per_rad": 16.77832748089279, "policy_kd_nm_s_per_rad": 1.06814150219, "policy_action_scale_rad": 0.07450087032950714, "default_angle_rad": 0},
+    {"index": 28, "name": "right_wrist_yaw_joint", "policy_isaaclab_index": 28, "command_sign": 1.0, "command_offset_rad": 0.0, "position_lower_rad": -1.61443, "position_upper_rad": 1.61443, "physical_actuator": "4010", "plant_effort_limit_nm": 5.0, "plant_velocity_limit_rad_s": 22.0, "plant_armature_kg_m2": 0.00425, "passive_damping_nm_s_per_rad": 0.05, "passive_frictionloss_nm": 0.1, "takeover_kp_nm_per_rad": 40.0, "takeover_kd_nm_s_per_rad": 1.0, "takeover_gain_basis": "unitree-sdk2-g1-ankle-swing-example", "policy_gain_basis": "4010", "policy_kp_nm_per_rad": 16.77832748089279, "policy_kd_nm_s_per_rad": 1.06814150219, "policy_action_scale_rad": 0.07450087032950714, "default_angle_rad": 0}
+  ]
+}

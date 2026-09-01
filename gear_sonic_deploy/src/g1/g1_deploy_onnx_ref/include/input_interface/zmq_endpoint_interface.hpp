@@ -901,7 +901,6 @@ private:
         streamed_motion_->name = "streamed";
         streamed_motion_->ReserveCapacity(15000, 29, 1, 1, 0, 0); // max 15k frames, 29 joints, 1 body, 1 quat
         stream_window_start_ = 0;
-        data_timestamp_.reset();
         last_receive_time_.reset();
         last_accepted_ticks_.store(0, std::memory_order_release);
         last_accepted_frame_start_.reset();
@@ -1385,7 +1384,7 @@ private:
             }
         }
         
-        if (num_frames < 2) {
+        if (num_frames < 1) {
             std::cerr << "[ZMQEndpointInterface] Invalid number of frames: " << num_frames << std::endl;
             return result;
         }
@@ -1644,21 +1643,33 @@ private:
             }
         }
 
-        for (const auto& frame_quaternions : decoded_body_quat) {
-            for (const auto& quaternion : frame_quaternions) {
-                double norm_squared = 0.0;
+        for (auto& frame_quaternions : decoded_body_quat) {
+            for (auto& quaternion : frame_quaternions) {
+                double scale = 0.0;
                 for (const double component : quaternion) {
-                    if (std::abs(component) > 2.0) {
-                        std::cerr << "[ZMQEndpointInterface] body_quat component out of range"
-                                  << std::endl;
-                        return result;
-                    }
-                    norm_squared += component * component;
+                    scale = std::max(scale, std::abs(component));
                 }
-                if (norm_squared < 0.25 || norm_squared > 2.25) {
+                if (!std::isfinite(scale) || scale == 0.0) {
                     std::cerr << "[ZMQEndpointInterface] Degenerate body quaternion"
                               << std::endl;
                     return result;
+                }
+                double scaled_norm_squared = 0.0;
+                for (const double component : quaternion) {
+                    const double scaled = component / scale;
+                    scaled_norm_squared += scaled * scaled;
+                }
+                const double scaled_norm = std::sqrt(scaled_norm_squared);
+                if (!std::isfinite(scaled_norm) || scaled_norm == 0.0) {
+                    std::cerr << "[ZMQEndpointInterface] Degenerate body quaternion"
+                              << std::endl;
+                    return result;
+                }
+                // Quaternion magnitude carries no rotation information. Keep
+                // the structural nonzero/finite contract and normalize,
+                // instead of imposing an empirical component/norm window.
+                for (double& component : quaternion) {
+                    component = (component / scale) / scaled_norm;
                 }
             }
         }
@@ -2070,10 +2081,9 @@ private:
             }
             if (i > 0) {
                 const int64_t delta = frame_indices[i] - frame_indices[i - 1];
-                if (delta <= 0 || delta > 1000 ||
-                    (i > 1 && delta != frame_step)) {
+                if (delta <= 0 || (i > 1 && delta != frame_step)) {
                     std::cerr << "[ZMQEndpointInterface] frame_index must be strictly "
-                                 "increasing with constant stride <= 1000"
+                                 "increasing with constant stride"
                               << std::endl;
                     return result;
                 }
@@ -2103,7 +2113,6 @@ private:
         // Decode optional side-channel values into locals.  They are committed
         // only after the complete motion window merges successfully.
         std::optional<double> decoded_heading_increment;
-        std::optional<std::chrono::steady_clock::time_point> decoded_data_timestamp;
 
         // Optional: decode heading_increment (single scalar, f32 or f64)
         if (heading_increment_idx >= 0) {
@@ -2126,47 +2135,13 @@ private:
             }
           }
 
-          if (std::abs(heading_increment) > 1.0) {
-            std::cerr << "[ZMQEndpointInterface] heading_increment exceeds 1 rad"
-                      << std::endl;
-            return result;
-          }
           decoded_heading_increment = heading_increment;
         }
 
-        // Optional: decode monotonic timestamp (single scalar, f64)
-        if (timestamp_monotonic_idx >= 0) {
-          double timestamp_monotonic = 0.0;
-          const auto& ts_buf = buffered_buffers_[timestamp_monotonic_idx];
-          const auto& ts_field = buffered_header_.fields[timestamp_monotonic_idx];
-          if (ts_field.dtype == "f64") {
-            double val = 0.0;
-            if (ts_buf.size() >= sizeof(double)) {
-              std::memcpy(&val, ts_buf.data(), sizeof(double));
-              if (needs_swap) val = byte_swap(val);
-              timestamp_monotonic = val;
-            }
-          }
-          if (is_localhost_)
-          {
-            const auto now = std::chrono::steady_clock::now();
-            const double now_seconds =
-                std::chrono::duration<double>(now.time_since_epoch()).count();
-            // Bound the floating value before duration_cast; converting a
-            // finite but enormous double to the clock's integer duration is
-            // otherwise outside the representable range.
-            if (timestamp_monotonic < now_seconds - 3600.0 ||
-                timestamp_monotonic > now_seconds + 1.0) {
-              std::cerr << "[ZMQEndpointInterface] timestamp_monotonic outside "
-                           "the accepted local-clock window" << std::endl;
-              return result;
-            }
-            auto duration_monotonic = std::chrono::duration<double>(timestamp_monotonic);
-            auto time_point_monotonic = std::chrono::steady_clock::time_point(
-                std::chrono::duration_cast<std::chrono::steady_clock::duration>(duration_monotonic));
-            decoded_data_timestamp = time_point_monotonic;
-          }
-        }
+        // timestamp_monotonic is validated above for shape, dtype and
+        // finiteness, but never used for freshness. Different processes need
+        // not share an epoch; the receiver's accepted-packet tick is the local
+        // liveness clock.
 
         // ===== Decode catch_up field if present =====
         // Default: catch_up = true (use MAX_GAP_FRAMES)
@@ -2351,13 +2326,17 @@ private:
           auto current_heading_state = heading_state_buffer.GetDataWithTime().data;
           const HeadingState current_state =
               current_heading_state ? *current_heading_state : HeadingState();
+          constexpr double kTwoPi = 6.283185307179586476925286766559;
+          // Both inputs are finite, but their direct sum can still overflow.
+          // Heading is periodic, so reduce each operand before addition and
+          // keep the stored state bounded without inventing an increment cap.
+          const double next_heading = std::remainder(
+              std::remainder(current_state.delta_heading, kTwoPi) +
+                  std::remainder(*decoded_heading_increment, kTwoPi),
+              kTwoPi);
           heading_state_buffer.SetData(
               HeadingState(current_state.init_base_quat,
-                           current_state.delta_heading +
-                               *decoded_heading_increment));
-        }
-        if (decoded_data_timestamp) {
-          data_timestamp_ = decoded_data_timestamp;
+                           next_heading));
         }
         
         // Convert MergeResult to DecodeResult.  The version -> mode mapping
@@ -2551,7 +2530,6 @@ private:
     // Timing / diagnostics
     // ------------------------------------------------------------------
     bool is_localhost_ = true;         ///< True if host_ is localhost (for directly comparing timestamps)
-    std::optional<std::chrono::steady_clock::time_point> data_timestamp_{};  ///< Timestamp of last received message from XR source
     std::optional<std::chrono::steady_clock::time_point> last_receive_time_{}; ///< Timestamp of last OnPoseDataReceived (ms, monotonic).
     std::atomic<int64_t> last_accepted_ticks_{0}; ///< Local monotonic nanoseconds of last fully validated and merged packet.
     std::atomic<int64_t> stream_enabled_ticks_{0}; ///< Fixed first-packet grace origin; never refreshed by traffic.

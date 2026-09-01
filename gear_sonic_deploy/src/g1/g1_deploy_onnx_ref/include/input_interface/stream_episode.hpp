@@ -20,7 +20,9 @@ inline bool IsValidIdentifier(std::string_view value) {
   if (value.empty() || value.size() > kMaxLength) {
     return false;
   }
-  for (const unsigned char character : value) {
+  for (std::size_t index = 0; index < value.size(); ++index) {
+    const unsigned char character =
+        static_cast<unsigned char>(value[index]);
     const bool alpha =
         (character >= static_cast<unsigned char>('A') &&
          character <= static_cast<unsigned char>('Z')) ||
@@ -28,9 +30,10 @@ inline bool IsValidIdentifier(std::string_view value) {
          character <= static_cast<unsigned char>('z'));
     const bool digit = character >= static_cast<unsigned char>('0') &&
                        character <= static_cast<unsigned char>('9');
-    if (!alpha && !digit && character != static_cast<unsigned char>('.') &&
+    if ((!alpha && !digit && index == 0) ||
+        (!alpha && !digit && character != static_cast<unsigned char>('.') &&
         character != static_cast<unsigned char>('_') &&
-        character != static_cast<unsigned char>('-')) {
+        character != static_cast<unsigned char>('-'))) {
       return false;
     }
   }

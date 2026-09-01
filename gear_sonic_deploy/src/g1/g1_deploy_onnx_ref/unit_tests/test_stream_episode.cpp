@@ -14,6 +14,9 @@ TEST(StreamEpisode, IdentifierGrammarMatchesReplayWireContract) {
   EXPECT_TRUE(episode::IsValidIdentifier(std::string(episode::kMaxLength, 'x')));
 
   EXPECT_FALSE(episode::IsValidIdentifier(""));
+  EXPECT_FALSE(episode::IsValidIdentifier(".episode"));
+  EXPECT_FALSE(episode::IsValidIdentifier("_episode"));
+  EXPECT_FALSE(episode::IsValidIdentifier("-episode"));
   EXPECT_FALSE(episode::IsValidIdentifier(
       std::string(episode::kMaxLength + 1, 'x')));
   EXPECT_FALSE(episode::IsValidIdentifier("with space"));

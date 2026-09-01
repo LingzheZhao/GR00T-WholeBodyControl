@@ -1,8 +1,8 @@
 set(EXECUTABLE_NAME g1_deploy_onnx_ref)
 
-# The reviewed JSON is the source of truth for every Mode-5 value that can
-# reach LowCmd.  Refuse configuration if the generated C++ mirror, canonical
-# rev1 MJCF, or released checkpoint triplet no longer matches it.
+# The JSON is the source of truth for Mode-5 values that reach LowCmd. Check
+# generated parameters and live model semantics, but do not make model bytes,
+# checkpoint bytes, repository revisions, or source hashes build credentials.
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set(MODE5_CONTRACT
     "${PROJECT_SOURCE_DIR}/g1/sonic_g1_mode5_derived_v1.contract.json")
@@ -10,10 +10,8 @@ set(MODE5_CONTRACT_GENERATOR
     "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_mode5_contract.py")
 set(MODE5_CONTRACT_HEADER
     "${CMAKE_CURRENT_SOURCE_DIR}/include/mode5_contract_generated.hpp")
-set(MODE5_TAKEOVER_SOURCE
-    "${PROJECT_SOURCE_DIR}/thirdparty/unitree_sdk2/example/g1/low_level/g1_ankle_swing_example.cpp")
 set(SONIC_WBC_ROOT "" CACHE PATH
-    "WholeBodyControl checkout used to verify deployment model artifacts")
+    "WholeBodyControl checkout used to verify G1 model semantics")
 if(NOT SONIC_WBC_ROOT AND DEFINED ENV{SONIC_WBC_ROOT})
   set(SONIC_WBC_ROOT "$ENV{SONIC_WBC_ROOT}")
 endif()
@@ -21,18 +19,13 @@ if(NOT SONIC_WBC_ROOT)
   set(SONIC_WBC_ROOT "${PROJECT_SOURCE_DIR}/..")
 endif()
 get_filename_component(SONIC_WBC_ROOT "${SONIC_WBC_ROOT}" ABSOLUTE)
-# Make an ordinary incremental `cmake --build` re-run this configure-time
-# verifier whenever any input to the attested profile changes.  Without this,
-# a previously configured build tree could compile against changed assets
-# while retaining yesterday's successful check.
+# Re-run the semantic verifier when generated inputs or active model/config
+# files change. ONNX checkpoints and provenance-only source files are runtime
+# inputs, so replacing them does not invalidate the C++ build.
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
   "${MODE5_CONTRACT}"
   "${MODE5_CONTRACT_GENERATOR}"
   "${MODE5_CONTRACT_HEADER}"
-  "${PROJECT_SOURCE_DIR}/policy/release/model_decoder.onnx"
-  "${PROJECT_SOURCE_DIR}/policy/release/model_encoder.onnx"
-  "${PROJECT_SOURCE_DIR}/policy/release/observation_config.yaml"
-  "${MODE5_TAKEOVER_SOURCE}"
   "${SONIC_WBC_ROOT}/gear_sonic/data/assets/robot_description/mjcf/g1_29dof_rev_1_0.xml"
   "${SONIC_WBC_ROOT}/decoupled_wbc/control/robot_model/model_data/g1/g1_29dof_with_hand_rev_1_0_activatedfinger.xml"
   "${SONIC_WBC_ROOT}/decoupled_wbc/control/robot_model/model_data/g1/scene_29dof_activated3dex.xml"
@@ -42,18 +35,16 @@ execute_process(
           --contract "${MODE5_CONTRACT}"
           --header "${MODE5_CONTRACT_HEADER}"
           --wbc-root "${SONIC_WBC_ROOT}"
-          --deploy-root "${PROJECT_SOURCE_DIR}"
-          --takeover-source "${MODE5_TAKEOVER_SOURCE}"
           --check
   RESULT_VARIABLE MODE5_CONTRACT_CHECK_RESULT
   OUTPUT_VARIABLE MODE5_CONTRACT_CHECK_STDOUT
   ERROR_VARIABLE MODE5_CONTRACT_CHECK_STDERR)
 if(NOT MODE5_CONTRACT_CHECK_RESULT EQUAL 0)
   message(FATAL_ERROR
-    "Mode-5 deployment contract verification failed.\n"
+    "Mode-5 parameter/model semantic verification failed.\n"
     "${MODE5_CONTRACT_CHECK_STDOUT}${MODE5_CONTRACT_CHECK_STDERR}")
 endif()
-message(STATUS "Verified generated Mode-5 deployment contract and pinned assets")
+message(STATUS "Verified generated Mode-5 parameters and live model semantics")
 
 # ROS2 discovery can be controlled via env var HAS_ROS2:
 # - 1: try ROS2 (find_package QUIET)

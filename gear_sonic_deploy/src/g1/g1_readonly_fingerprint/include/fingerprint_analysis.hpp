@@ -25,6 +25,8 @@ struct Snapshot {
   std::array<std::array<std::uint32_t, 2>, kMotorSlots> motor_sensors{};
   std::array<std::array<std::int16_t, 2>, kMotorSlots> motor_temperatures{};
   std::int16_t imu_temperature{};
+  std::array<float, 29> q{};
+  std::array<float, 29> dq{};
 };
 
 struct ReportInput {
@@ -132,13 +134,9 @@ inline ReportResult BuildReport(const std::vector<Snapshot>& samples,
   }
   if (regressing != 0) issues.emplace_back("tick_regressed");
 
-  const bool stable = issues.empty();
   std::ostringstream output;
-  output << "{\"schema\":\"motionlcm.g1.readonly-fingerprint.v1\""
-         << ",\"status\":\"" << (stable ? "stable" : "rejected") << '"'
+  output << "{\"schema\":\"motionlcm.g1.readonly-lowstate-diagnostic.v1\""
          << ",\"receive_only\":true"
-         << ",\"deployment_authorized\":false"
-         << ",\"profile_inference\":null"
          << ",\"topic\":\"rt/lowstate\""
          << ",\"interface\":" << JsonString(input.interface)
          << ",\"domain_id\":" << input.domain_id
@@ -146,7 +144,7 @@ inline ReportResult BuildReport(const std::vector<Snapshot>& samples,
          << ",\"sample_count\":" << samples.size()
          << ",\"minimum_sample_count\":" << input.minimum_samples
          << ",\"invalid_crc_sample_count\":" << input.invalid_crc_samples
-         << ",\"issues\":";
+         << ",\"diagnostic_findings\":";
   AppendIssues(output, issues);
   output << ",\"observations\":{";
 
@@ -190,7 +188,9 @@ inline ReportResult BuildReport(const std::vector<Snapshot>& samples,
            << ",\"motor_status_vector\":null"
            << ",\"motor_sensor_vector\":null"
            << ",\"motor_temperature_ranges\":null"
-           << ",\"imu_temperature_range\":null";
+           << ",\"imu_temperature_range\":null"
+           << ",\"latest_q\":null"
+           << ",\"latest_dq\":null";
   } else {
     const auto& latest = samples.back();
     std::array<std::uint32_t, kMotorSlots> motor_status_or{};
@@ -233,10 +233,14 @@ inline ReportResult BuildReport(const std::vector<Snapshot>& samples,
       imu_maximum = std::max(imu_maximum, sample.imu_temperature);
     }
     output << "],\"imu_temperature_range\":[" << imu_minimum << ','
-           << imu_maximum << ']';
+           << imu_maximum << "]"
+           << ",\"latest_q\":";
+    AppendNumericArray(output, latest.q);
+    output << ",\"latest_dq\":";
+    AppendNumericArray(output, latest.dq);
   }
   output << "}}";
-  return {output.str(), stable ? 0 : 2};
+  return {output.str(), issues.empty() ? 0 : 2};
 }
 
 }  // namespace g1_fingerprint

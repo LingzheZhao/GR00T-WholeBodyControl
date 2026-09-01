@@ -1,10 +1,12 @@
 #include "fingerprint_analysis.hpp"
 
 #include <unitree/idl/hg/LowState_.hpp>
+#include <unitree/idl/hg/IMUState_.hpp>
 #include <unitree/robot/channel/channel_subscriber.hpp>
 
 #include <net/if.h>
 
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <cstdlib>
@@ -22,6 +24,7 @@
 namespace {
 
 using LowState = unitree_hg::msg::dds_::LowState_;
+using IMUState = unitree_hg::msg::dds_::IMUState_;
 
 struct Options {
   std::string interface;
@@ -121,6 +124,9 @@ int main(int argc, char** argv) {
     std::mutex mutex;
     std::vector<g1_fingerprint::Snapshot> samples;
     std::size_t invalid_crc_samples = 0;
+    std::size_t secondary_imu_samples = 0;
+    std::array<float, 29> latest_q{};
+    std::array<float, 29> latest_dq{};
 
     unitree::robot::ChannelFactory::Instance()->Init(options.domain_id,
                                                       options.interface);
@@ -138,23 +144,56 @@ int main(int argc, char** argv) {
             ++invalid_crc_samples;
             return;
           }
+          for (std::size_t index = 0; index < latest_q.size(); ++index) {
+            latest_q[index] = state.motor_state()[index].q();
+            latest_dq[index] = state.motor_state()[index].dq();
+          }
           samples.push_back(MakeSnapshot(state));
+        },
+        64);
+    auto secondary_imu_receiver = std::make_shared<
+        unitree::robot::ChannelSubscriber<IMUState>>("rt/secondary_imu");
+    secondary_imu_receiver->InitChannel(
+        [&](const void*) {
+          std::lock_guard<std::mutex> lock(mutex);
+          ++secondary_imu_samples;
         },
         64);
 
     const auto started = std::chrono::steady_clock::now();
     std::this_thread::sleep_for(std::chrono::seconds(options.duration_seconds));
     receiver->CloseChannel();
+    secondary_imu_receiver->CloseChannel();
     const auto elapsed = std::chrono::duration<double>(
         std::chrono::steady_clock::now() - started).count();
 
     std::vector<g1_fingerprint::Snapshot> captured;
     std::size_t captured_invalid_crc = 0;
+    std::size_t captured_secondary_imu = 0;
+    std::array<float, 29> captured_q{};
+    std::array<float, 29> captured_dq{};
     {
       std::lock_guard<std::mutex> lock(mutex);
       captured = samples;
       captured_invalid_crc = invalid_crc_samples;
+      captured_secondary_imu = secondary_imu_samples;
+      captured_q = latest_q;
+      captured_dq = latest_dq;
     }
+    std::cerr << "G1_READONLY_DIAGNOSTIC: {\"secondary_imu_sample_count\":"
+              << captured_secondary_imu << ",\"latest_q\":";
+    const auto append_array = [](const auto& values) {
+      std::cerr << '[';
+      for (std::size_t index = 0; index < values.size(); ++index) {
+        if (index != 0) std::cerr << ',';
+        std::cerr << values[index];
+      }
+      std::cerr << ']';
+    };
+    append_array(captured_q);
+    std::cerr << ",\"latest_dq\":";
+    append_array(captured_dq);
+    std::cerr << "}" << std::endl;
     const auto report = g1_fingerprint::BuildReport(
         captured,
         {.interface = options.interface,

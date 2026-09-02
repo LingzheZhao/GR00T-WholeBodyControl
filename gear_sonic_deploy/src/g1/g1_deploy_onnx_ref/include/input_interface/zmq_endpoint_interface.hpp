@@ -267,6 +267,21 @@ public:
                 std::chrono::nanoseconds(ticks)));
     }
 
+    /// Local time at which the current streaming epoch was enabled.
+    ///
+    /// Unlike GetLastAcceptedUpdateTime(), this is not evidence of publisher
+    /// progress.  The physical controller uses it only as the fixed origin of
+    /// a bounded first-window grace period after a streaming reset.
+    std::optional<std::chrono::steady_clock::time_point>
+    GetStreamEnabledTime() const {
+        const int64_t ticks =
+            stream_enabled_ticks_.load(std::memory_order_acquire);
+        if (ticks == 0) return std::nullopt;
+        return std::chrono::steady_clock::time_point(
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::nanoseconds(ticks)));
+    }
+
     static constexpr std::string_view LOCALHOST = "localhost";
 
     ZMQEndpointInterface(

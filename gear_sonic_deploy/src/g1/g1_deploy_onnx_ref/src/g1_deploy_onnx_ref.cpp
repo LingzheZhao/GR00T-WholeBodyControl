@@ -43,8 +43,6 @@
  *   --output-type         | zmq / ros2 / all
  *   --disable-crc-check   | Skip CRC validation (requires --simulation-only)
  *   --simulation-only     | Run against a simulator transport
- *   --enable-command-q-clamp | Compatibility flag; hard-limit clamp is always on
- *   --command-max-delta-rad  | Deprecated compatibility option (ignored)
  *   --planner-fp16        | Use FP16 for planner TensorRT engine
  *   --policy-fp16         | Use FP16 for policy TensorRT engine
  *   --print-capabilities  | Print the SONIC_CAPABILITIES_V1 line and exit (no robot/GPU)
@@ -120,6 +118,7 @@
 #include "../include/robot_parameters.hpp"
 #include "../include/policy_parameters.hpp"
 #include "../include/control_progress_watchdog.hpp"
+#include "../include/physical_runtime_safety.hpp"
 
 // Input interface and input handlers
 #include "../include/input_interface/keyboard_handler.hpp"
@@ -272,10 +271,7 @@ std::string BuildSonicCapabilityLine(const std::vector<EncoderModeConfig>& encod
   line << "],\"pose_protocol_versions\":[1,2,3]"
        << ",\"capability_schema\":\"motionlcm.sonic.capabilities.v1\""
        << ",\"force_encode_mode_env\":true"
-       << ",\"initial_encoder_mode\":" << initial_encoder_mode
-       << ",\"command_q_clamp_flag\":true"
-       << ",\"command_delta_limit_flag\":false"
-       << ",\"command_max_delta_rad\":null}";
+       << ",\"initial_encoder_mode\":" << initial_encoder_mode << "}";
   return line.str();
 }
 
@@ -440,12 +436,16 @@ class G1Deploy {
       INIT_STATE_DISAPPEARED,
       INIT_STATE_STALE,
       LOW_STATE_MISSING,
+      IDENTITY_DIVERGENCE,
       LOW_STATE_STALE,
       MOTOR_FAULT_MONITOR,
       MOTOR_STATUS,
       NONFINITE_MOTOR_STATE,
       CONTROL_PROGRESS_TIMEOUT,
       LOWCMD_WRITE_FAILURE,
+      ZMQ_WINDOW_STALE,
+      ZMQ_WINDOW_MISSING,
+      PRECONTROL_STREAM_NOT_READY,
       ROBOT_STATE_GATHER_FAILURE,
       INPUT_GATHER_FAILURE,
       OBSERVATION_GATHER_FAILURE,
@@ -464,8 +464,9 @@ class G1Deploy {
     double duration_;      ///< Contract duration of the INIT ramp to default pose.
     int counter_;          ///< General-purpose tick counter.
     const bool simulation_only_;
-    // DDS callback writes this while the 500 Hz command thread reads it.
-    std::atomic<uint8_t> mode_machine_; ///< Robot variant code received from LowState.
+    // Serializes CRC-accepted LowState publication with the final physical
+    // Mode-5/PR0 confirmation. Any later identity change is a one-way fault.
+    sonic::physical_runtime_safety::Mode5IdentityGate physical_identity_gate_;
     
     // =========================================================================
     // Input interface and buffered input data
@@ -593,6 +594,7 @@ class G1Deploy {
     // half a second; the damping latch and command clamps remain the
     // fast-path protections.
     static constexpr std::chrono::milliseconds STREAMING_DATA_ABSENT_THRESHOLD{400};
+    static constexpr std::chrono::milliseconds ZMQ_STREAM_STARTUP_GRACE{400};
     CounterDebouncer streaming_data_absent_debouncer_{100, 500, 50, 1};
     RollingStats<1000> streaming_data_delay_rolling_stats_;
     std::unique_ptr<AudioThread> audio_thread_;
@@ -2637,13 +2639,89 @@ class G1Deploy {
     }
 
     void WaitForInitialLowStateOrThrow() {
-      while (!low_state_buffer_.GetDataWithTime().data) {
+      if (simulation_only_) {
+        while (!low_state_buffer_.GetDataWithTime().data) {
+          if (g_shutdown_requested) {
+            throw std::runtime_error(
+                "shutdown requested while waiting for initial LowState");
+          }
+          std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return;
+      }
+
+      // Physical LowState reaches the buffer only after LowStateHandler has
+      // verified its CRC. Refuse takeover until that accepted sample is also
+      // fresh and carries the exact identity pinned by the generated contract.
+      constexpr auto kIdentityWaitTimeout = std::chrono::seconds(10);
+      const auto deadline =
+          std::chrono::steady_clock::now() + kIdentityWaitTimeout;
+      while (std::chrono::steady_clock::now() < deadline) {
         if (g_shutdown_requested) {
           throw std::runtime_error(
               "shutdown requested while waiting for initial LowState");
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+        const auto candidate = low_state_buffer_.GetDataWithTime();
+        const auto now = std::chrono::steady_clock::now();
+        if (!candidate.data || candidate.timestamp > now ||
+            now - candidate.timestamp > LOW_STATE_ABSENT_THRESHOLD) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(20));
+          continue;
+        }
+        if (!sonic::physical_runtime_safety::MatchesMode5LowStateIdentity(
+                candidate.data->mode_machine(), candidate.data->mode_pr())) {
+          throw std::runtime_error(
+              "physical LowState identity mismatch before takeover: require "
+              "mode_machine=" +
+              std::to_string(sonic::mode5_contract::kModeMachine) +
+              ", mode_pr=" + std::to_string(sonic::mode5_contract::kModePr) +
+              "; observed mode_machine=" +
+              std::to_string(candidate.data->mode_machine()) +
+              ", mode_pr=" + std::to_string(candidate.data->mode_pr()));
+        }
+
+        bool identity_changed_during_arm = false;
+        std::string arm_failure;
+        const bool armed = physical_identity_gate_.ArmIf([&]() {
+          const auto confirmed = low_state_buffer_.GetDataWithTime();
+          const auto confirmed_now = std::chrono::steady_clock::now();
+          if (!confirmed.data || confirmed.timestamp > confirmed_now ||
+              confirmed_now - confirmed.timestamp >
+                  LOW_STATE_ABSENT_THRESHOLD) {
+            arm_failure =
+                "physical LowState became stale while arming the identity gate";
+            return false;
+          }
+          if (!sonic::physical_runtime_safety::MatchesMode5LowStateIdentity(
+                  confirmed.data->mode_machine(), confirmed.data->mode_pr())) {
+            identity_changed_during_arm = true;
+            arm_failure =
+                "physical LowState identity changed while arming the takeover gate";
+            return false;
+          }
+          if (HasLatchedSafetyFault()) {
+            arm_failure = "a safety fault latched while arming the identity gate";
+            return false;
+          }
+          return true;
+        });
+        if (!armed) {
+          if (identity_changed_during_arm) {
+            LatchSafetyFault(SafetyFaultReason::IDENTITY_DIVERGENCE);
+          }
+          throw std::runtime_error(arm_failure);
+        }
+        std::cout << "[SAFETY] Fresh CRC-valid LowState identity accepted: "
+                  << "mode_machine="
+                  << unsigned(sonic::mode5_contract::kModeMachine)
+                  << ", mode_pr=" << unsigned(sonic::mode5_contract::kModePr)
+                  << std::endl;
+        return;
       }
+      throw std::runtime_error(
+          "timed out waiting for fresh CRC-valid Mode-5/PR0 LowState before "
+          "takeover");
     }
 
     bool IntentionalShutdownRequested() const noexcept {
@@ -2695,6 +2773,8 @@ class G1Deploy {
           return "robot state became stale after INIT actuation began";
         case SafetyFaultReason::LOW_STATE_MISSING:
           return "LowState missing during active safety check";
+        case SafetyFaultReason::IDENTITY_DIVERGENCE:
+          return "LowState mode_machine/mode_pr diverged from Mode-5/PR0";
         case SafetyFaultReason::LOW_STATE_STALE:
           return "LowState exceeded the freshness threshold";
         case SafetyFaultReason::MOTOR_FAULT_MONITOR:
@@ -2707,6 +2787,12 @@ class G1Deploy {
           return "the 50 Hz Control producer stopped making successful progress";
         case SafetyFaultReason::LOWCMD_WRITE_FAILURE:
           return "the LowCmd publisher failed to write a body command";
+        case SafetyFaultReason::ZMQ_WINDOW_STALE:
+          return "the validated ZMQ command stream exceeded its freshness deadline";
+        case SafetyFaultReason::ZMQ_WINDOW_MISSING:
+          return "physical ZMQ CONTROL has no accepted validated window";
+        case SafetyFaultReason::PRECONTROL_STREAM_NOT_READY:
+          return "physical CONTROL was requested before a fresh exact-episode streamed motion was active";
         case SafetyFaultReason::ROBOT_STATE_GATHER_FAILURE:
           return "robot-state gathering failed during CONTROL";
         case SafetyFaultReason::INPUT_GATHER_FAILURE:
@@ -2765,13 +2851,8 @@ class G1Deploy {
       bool enable_motion_recording = false,
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
       double initial_max_close_ratio = 1.0,
-      bool enable_command_q_clamp = false,
-      bool simulation_study_disable_command_q_clamp = false,
-      std::optional<double> command_max_delta_rad = std::nullopt,
-      bool manual_takeover_authorization = false,
       bool enable_dex3_hands = true,
-      bool simulation_only = false,
-      std::string hardware_profile = "")
+      bool simulation_only = false)
       : time_(0.0),
         publish_dt_(1.0 / sonic::mode5_contract::kWriterRateHz),
         control_dt_(std::chrono::duration<double>(
@@ -2782,7 +2863,6 @@ class G1Deploy {
         duration_(sonic::mode5_contract::kTakeoverDurationSeconds),
         counter_(0),
         simulation_only_(simulation_only),
-        mode_machine_(0),
         disable_crc_check_(disable_crc_check),
         program_state_(ProgramState::INIT),
         last_action {0.0},
@@ -2797,13 +2877,10 @@ class G1Deploy {
         planner_path(planner_file_path) {
       
       ValidateRuntimeTransportOrThrow(disable_crc_check, simulation_only);
-      (void)enable_command_q_clamp;
-      (void)simulation_study_disable_command_q_clamp;
-      (void)command_max_delta_rad;
-      (void)manual_takeover_authorization;
-      (void)hardware_profile;
 
-      // No robot-facing SDK object is created until profile validation returns.
+      // Transport invariants are checked before the first robot-facing SDK
+      // object is created. LowState identity is checked after DDS begins
+      // receiving, but still before low-level takeover.
       ChannelFactory::Instance()->Init(0, networkInterface);
 
       // Dex3 is an independent actuator side channel.  Hardware launchers can
@@ -3179,8 +3256,19 @@ class G1Deploy {
       // so refuse any other input type here rather than start unguarded.  This
       // is still before the control threads exist and before any motor command
       // has been written.
+      const bool standalone_zmq =
+          dynamic_cast<ZMQEndpointInterface*>(input_interface_.get()) != nullptr;
+      if (!simulation_only_ && !standalone_zmq) {
+        throw std::runtime_error(
+            "physical runtime requires --input-type zmq before takeover");
+      }
+      if (!simulation_only_ && !expected_stream_episode_.has_value()) {
+        throw std::runtime_error(
+            "physical runtime requires SONIC_EXPECTED_STREAM_EPISODE before "
+            "takeover");
+      }
       if ((expected_stream_mode_ >= 0 || expected_stream_episode_.has_value()) &&
-          dynamic_cast<ZMQEndpointInterface*>(input_interface_.get()) == nullptr) {
+          !standalone_zmq) {
         std::cerr << "Error: SONIC_EXPECTED_STREAM_MODE and "
                      "SONIC_EXPECTED_STREAM_EPISODE are only enforced with "
                      "--input-type zmq, but this run uses --input-type "
@@ -3290,6 +3378,15 @@ class G1Deploy {
           JoinWorkerThreads();
         }
         throw;
+      }
+
+      // Identity monitoring is armed before MotionSwitcher release begins.
+      // If it diverged during that handoff, the boundary write above was
+      // already damping; keep the writer on damping and abort construction.
+      if (HasLatchedSafetyFault()) {
+        EmergencyDampingAndJoin();
+        throw std::runtime_error(
+            "LowState identity diverged during low-level takeover");
       }
 
       if (g_shutdown_requested) {
@@ -3464,13 +3561,22 @@ class G1Deploy {
         error_monitor_.update(motorstates);
       }
 
-      const uint8_t incoming_mode = low_state.mode_machine();
-      const uint8_t previous_mode =
-          mode_machine_.exchange(incoming_mode, std::memory_order_acq_rel);
-      if (previous_mode == 0 && previous_mode != incoming_mode) {
-        std::cout << "G1 type: " << unsigned(incoming_mode) << std::endl;
+      // Publish the CRC-accepted sample and evaluate its identity under the
+      // same gate mutex used by final pre-takeover confirmation. A callback
+      // cannot decide "not armed" and then publish a mismatch after arming.
+      const bool armed_identity_mismatch =
+          physical_identity_gate_.PublishAndCheck(
+              low_state.mode_machine(), low_state.mode_pr(),
+              [&]() { low_state_buffer_.SetData(low_state); });
+      if (!simulation_only_ && armed_identity_mismatch) {
+        if (LatchSafetyFault(SafetyFaultReason::IDENTITY_DIVERGENCE)) {
+          std::cerr << "[SAFETY] LowState identity changed to mode_machine="
+                    << unsigned(low_state.mode_machine()) << ", mode_pr="
+                    << unsigned(low_state.mode_pr())
+                    << "; latching damping for required Mode-5/PR0"
+                    << std::endl;
+        }
       }
-      low_state_buffer_.SetData(low_state);
     }
 
     /// DDS callback: receives secondary (torso) IMU data.
@@ -3527,9 +3633,9 @@ class G1Deploy {
       }
 
       LowCmd_ dds_low_command;
-      dds_low_command.mode_pr() = 0;
+      dds_low_command.mode_pr() = sonic::mode5_contract::kModePr;
       dds_low_command.mode_machine() =
-          mode_machine_.load(std::memory_order_acquire);
+          sonic::mode5_contract::kModeMachine;
 
       const auto command_snapshot = motor_command_buffer_.GetDataWithTime();
       const bool force_damping = force_damping_.load(std::memory_order_acquire);
@@ -3742,6 +3848,16 @@ class G1Deploy {
       }
 
       auto now = std::chrono::steady_clock::now();
+      if (!simulation_only_ &&
+          !sonic::physical_runtime_safety::MatchesMode5LowStateIdentity(
+              ls->mode_machine(), ls->mode_pr())) {
+        LatchSafetyFault(SafetyFaultReason::IDENTITY_DIVERGENCE);
+        std::cout << "[ERROR] LowState identity is mode_machine="
+                  << unsigned(ls->mode_machine()) << ", mode_pr="
+                  << unsigned(ls->mode_pr())
+                  << "; physical runtime requires Mode-5/PR0" << std::endl;
+        return false;
+      }
       if (now - low_state_data.timestamp > LOW_STATE_ABSENT_THRESHOLD) {
         LatchSafetyFault(SafetyFaultReason::LOW_STATE_STALE);
         std::cout << "[ERROR] LowState is older than "
@@ -4021,9 +4137,42 @@ class G1Deploy {
       std::tie(has_upper_body_data_, upper_body_joint_positions_buffer_) = input_interface_->GetUpperBodyJointPositions();
       std::tie(std::ignore, upper_body_joint_velocities_buffer_) = input_interface_->GetUpperBodyJointVelocities();
 
+      const auto now = std::chrono::steady_clock::now();
+      const auto* zmq_endpoint =
+          dynamic_cast<const ZMQEndpointInterface*>(input_interface_.get());
+      if (!simulation_only_) {
+        const auto accepted = zmq_endpoint
+            ? zmq_endpoint->GetLastAcceptedUpdateTime()
+            : std::nullopt;
+        const auto stream_enabled = zmq_endpoint
+            ? zmq_endpoint->GetStreamEnabledTime()
+            : std::nullopt;
+        const auto window_state =
+            sonic::physical_runtime_safety::EvaluateAcceptedWindow(
+                zmq_endpoint && zmq_endpoint->IsStreamingActive(), accepted,
+                stream_enabled, now, STREAMING_DATA_ABSENT_THRESHOLD,
+                ZMQ_STREAM_STARTUP_GRACE);
+        if (window_state ==
+            sonic::physical_runtime_safety::AcceptedWindowState::STALE) {
+          LatchSafetyFault(SafetyFaultReason::ZMQ_WINDOW_STALE);
+          std::cerr << "[SAFETY] No fully validated ZMQ window for more than "
+                    << STREAMING_DATA_ABSENT_THRESHOLD.count()
+                    << " ms; latching damping" << std::endl;
+          return false;
+        }
+        if (window_state !=
+            sonic::physical_runtime_safety::AcceptedWindowState::CURRENT) {
+          LatchSafetyFault(SafetyFaultReason::ZMQ_WINDOW_MISSING);
+          std::cerr << "[SAFETY] Physical ZMQ CONTROL requires a current "
+                       "accepted window; latching damping"
+                    << std::endl;
+          return false;
+        }
+      }
+
       auto last_update_time = input_interface_->GetLastUpdateTime();
       if (last_update_time.has_value()) {
-        auto streaming_data_delay = std::chrono::steady_clock::now() - last_update_time.value();
+        auto streaming_data_delay = now - last_update_time.value();
         streaming_data_delay_rolling_stats_.push(static_cast<double>(std::chrono::duration_cast<std::chrono::milliseconds>(streaming_data_delay).count()));
 
         bool streaming_data_absent = streaming_data_delay > STREAMING_DATA_ABSENT_THRESHOLD;
@@ -4031,7 +4180,7 @@ class G1Deploy {
       }
 
       auto low_state_data = low_state_buffer_.GetDataWithTime();
-      bool low_state_late = (std::chrono::steady_clock::now() - low_state_data.timestamp) > LOW_STATE_LATE_THRESHOLD;
+      bool low_state_late = (now - low_state_data.timestamp) > LOW_STATE_LATE_THRESHOLD;
 
       audio_thread_->SetCommand(
         AudioCommand{
@@ -4954,6 +5103,47 @@ class G1Deploy {
           // before the policy is activated (ZMQ PUB has no persistence).
           for (auto& oi : output_interfaces_) { if (oi) oi->publish_config(); }
           if (operator_state.start) {
+            // The browser choreography is defense in depth. The controller is
+            // authoritative even for an attached terminal that sends ']' early:
+            // physical policy control requires a current fully validated window
+            // bound to the exact episode for this run, and that window must
+            // already be the active streamed motion.
+            if (!simulation_only_) {
+              const auto* zmq_endpoint =
+                  dynamic_cast<const ZMQEndpointInterface*>(
+                      input_interface_.get());
+              const auto accepted = zmq_endpoint
+                  ? zmq_endpoint->GetLastAcceptedUpdateTime()
+                  : std::nullopt;
+              const auto stream_enabled = zmq_endpoint
+                  ? zmq_endpoint->GetStreamEnabledTime()
+                  : std::nullopt;
+              const auto window_state =
+                  sonic::physical_runtime_safety::EvaluateAcceptedWindow(
+                      zmq_endpoint && zmq_endpoint->IsStreamingActive(),
+                      accepted, stream_enabled,
+                      std::chrono::steady_clock::now(),
+                      STREAMING_DATA_ABSENT_THRESHOLD,
+                      ZMQ_STREAM_STARTUP_GRACE);
+              bool streamed_motion_active = false;
+              {
+                std::lock_guard<std::mutex> lock(current_motion_mutex_);
+                streamed_motion_active =
+                    current_motion_ && current_motion_->name == "streamed" &&
+                    current_motion_->timesteps > 0;
+              }
+              if (!sonic::physical_runtime_safety::ReadyForPhysicalControl(
+                      expected_stream_episode_.has_value(),
+                      streamed_motion_active, window_state)) {
+                std::cerr
+                    << "[SAFETY] Refusing physical CONTROL before a fresh "
+                       "exact-episode validated streamed motion is active"
+                    << std::endl;
+                LatchSafetyFault(
+                    SafetyFaultReason::PRECONTROL_STREAM_NOT_READY);
+                break;
+              }
+            }
             // Warn if starting control in token mode without tokens, but allow it
             if (initial_encoder_mode_ == -1 && !first_token_received_) {
               static int warn_count = 0;
@@ -5259,11 +5449,6 @@ void PrintUsage(const char* program) {
   std::cout << "  --policy-input-logfile <path>: write policy input tensors to a csv file if provided" << std::endl;
   std::cout << "  --disable-crc-check: disable CRC validation for MuJoCo simulation" << std::endl;
   std::cout << "  --simulation-only: run against a simulator transport (required with --disable-crc-check)" << std::endl;
-  std::cout << "  --hardware-profile <id>: deprecated compatibility option (ignored)" << std::endl;
-  std::cout << "  --enable-command-q-clamp: compatibility option; true G1 joint-limit clamp is always enabled" << std::endl;
-  std::cout << "  --simulation-study-disable-command-q-clamp: deprecated compatibility option (ignored)" << std::endl;
-  std::cout << "  --command-max-delta-rad <rad>: deprecated compatibility option (ignored; no per-tick delta limit)" << std::endl;
-  std::cout << "  --manual-takeover-authorization: deprecated compatibility option (ignored)" << std::endl;
   std::cout << "  --disable-dex3-hands: do not create or publish Dex3 hand command channels" << std::endl;
   std::cout << "  --obs-config <path>: specify observation configuration YAML file" << std::endl;
   std::cout << "  --print-capabilities: with --obs-config, print the SONIC_CAPABILITIES_V1 line and exit (no robot/GPU needed)" << std::endl;
@@ -5298,13 +5483,13 @@ void PrintUsage(const char* program) {
   std::cout << "                                is printed (at most once per second).  Unset means" << std::endl;
   std::cout << "                                the publisher alone decides the mode." << std::endl;
   std::cout << "  SONIC_EXPECTED_STREAM_EPISODE=<id>: exact per-run pose-header episode;" << std::endl;
-  std::cout << "                                optional for both physical and simulation runs." << std::endl;
-  std::cout << "                                When set, non-identical packets are dropped." << std::endl;
+  std::cout << "                                required before physical CONTROL; optional in simulation." << std::endl;
+  std::cout << "                                Non-identical packets are dropped when bound." << std::endl;
   std::cout << "  Both are parsed strictly: an unparseable id, or one the loaded observation" << std::endl;
   std::cout << "  config does not declare, prints '<name> invalid: <value>' and exits 1." << std::endl;
   std::cout << "\nExamples:" << std::endl;
   std::cout << "  " << program << " lo policy/single_frame/model.onnx reference/bones_072925_test/ --planner-file policy/planner.onnx --obs-config policy/single_frame/observation_config.yaml --disable-crc-check --simulation-only" << std::endl;
-  std::cout << "  SONIC_FORCE_ENCODE_MODE=0 SONIC_EXPECTED_STREAM_MODE=0 " << program << " enp5s0 policy/release/model_decoder.onnx reference/example --obs-config policy/release/observation_config.yaml --encoder-file policy/release/model_encoder.onnx --input-type zmq --disable-dex3-hands" << std::endl;
+  std::cout << "  SONIC_FORCE_ENCODE_MODE=0 SONIC_EXPECTED_STREAM_MODE=0 SONIC_EXPECTED_STREAM_EPISODE=episode-a " << program << " enp5s0 policy/release/model_decoder.onnx reference/example --obs-config policy/release/observation_config.yaml --encoder-file policy/release/model_encoder.onnx --input-type zmq --disable-dex3-hands" << std::endl;
   std::cout << "  " << program << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type gamepad --planner-file policy/planner.onnx" << std::endl;
   std::cout << "  " << program << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type gamepad_manager --planner-file policy/planner.onnx --zmq-host localhost --zmq-port 5556" << std::endl;
   std::cout << "  " << program << " enp5s0 policy/single_frame/model.onnx reference/bones_072925_test/ --input-type zmq --zmq-host 192.168.1.2 --zmq-port 5556 --zmq-topic pose --zmq-conflate" << std::endl;
@@ -5339,21 +5524,26 @@ int main(int argc, char const* argv[]) {
   // config parser is a self-contained line reader (ObservationConfigParser in
   // include/observation_config.hpp) with no such dependencies.
   {
-    bool print_capabilities = false;
-    std::string capabilities_obs_config;
-    for (int i = 1; i < argc; ++i) {
-      const std::string arg = argv[i];
-      if (arg == "--print-capabilities") {
-        print_capabilities = true;
-      } else if (arg == "--obs-config" && i + 1 < argc) {
-        capabilities_obs_config = argv[++i];
-      } else if ((arg == "--command-max-delta-rad" ||
-                  arg == "--hardware-profile") && i + 1 < argc) {
-        ++i;
-      }
-    }
+    const bool print_capabilities = std::any_of(
+        argv + 1, argv + argc, [](const char* value) {
+          return std::string_view(value) == "--print-capabilities";
+        });
 
     if (print_capabilities) {
+      std::string capabilities_obs_config;
+      for (int i = 1; i < argc; ++i) {
+        const std::string_view arg = argv[i];
+        if (arg == "--print-capabilities") {
+          continue;
+        }
+        if (arg == "--obs-config" && i + 1 < argc) {
+          capabilities_obs_config = argv[++i];
+          continue;
+        }
+        std::cerr << "Error: unknown capability option: " << argv[i]
+                  << std::endl;
+        return 1;
+      }
       if (capabilities_obs_config.empty()) {
         std::cerr << "Error: --print-capabilities requires --obs-config <path>" << std::endl;
         return 1;
@@ -5388,7 +5578,6 @@ int main(int argc, char const* argv[]) {
   // Parse optional arguments
   bool disableCrcCheck = false;
   bool simulationOnly = false;
-  std::string hardwareProfile;
   std::string obsConfigPath = "";
   std::string encoderFile = "";
   std::string targetMotionLogfile = "";
@@ -5412,10 +5601,6 @@ int main(int argc, char const* argv[]) {
   std::string zmq_out_topic = "g1_debug";
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
-  bool enableCommandQClamp = false;
-  bool simulationStudyDisableCommandQClamp = false;
-  std::optional<double> commandMaxDeltaRad;
-  bool manualTakeoverAuthorization = false;
   bool enableDex3Hands = true;
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
@@ -5424,39 +5609,9 @@ int main(int argc, char const* argv[]) {
     } else if (std::string(argv[i]) == "--simulation-only") {
       simulationOnly = true;
       std::cout << "[INFO] Simulation transport enabled" << std::endl;
-    } else if (std::string(argv[i]) == "--hardware-profile") {
-      if (i + 1 >= argc) {
-        std::cerr << "Error: --hardware-profile requires an id" << std::endl;
-        exit(1);
-      }
-      hardwareProfile = argv[++i];
-      std::cout << "[INFO] Ignoring deprecated --hardware-profile "
-                << hardwareProfile << std::endl;
-    } else if (std::string(argv[i]) == "--enable-command-q-clamp") {
-      enableCommandQClamp = true;
-      std::cout << "[INFO] G1 joint-limit clamp is always enabled" << std::endl;
-    } else if (std::string(argv[i]) ==
-               "--simulation-study-disable-command-q-clamp") {
-      simulationStudyDisableCommandQClamp = true;
-      std::cout << "[INFO] Ignoring deprecated q-clamp study option; true G1 "
-                   "joint-limit clamp remains enabled" << std::endl;
-    } else if (std::string(argv[i]) == "--manual-takeover-authorization") {
-      manualTakeoverAuthorization = true;
-      std::cout << "[INFO] Ignoring deprecated manual takeover option"
-                << std::endl;
     } else if (std::string(argv[i]) == "--disable-dex3-hands") {
       enableDex3Hands = false;
       std::cout << "[SAFETY] Dex3 hand actuation disabled" << std::endl;
-    } else if (std::string(argv[i]) == "--command-max-delta-rad") {
-      if (i + 1 >= argc) {
-        std::cerr << "Error: --command-max-delta-rad requires a value"
-                  << std::endl;
-        exit(1);
-      }
-      ++i;
-      commandMaxDeltaRad.reset();
-      std::cout << "[INFO] Ignoring deprecated --command-max-delta-rad; no "
-                   "per-tick delta limit is applied" << std::endl;
     } else if (std::string(argv[i]) == "--obs-config") {
       if (i + 1 < argc) {
         obsConfigPath = argv[i + 1];
@@ -5689,9 +5844,8 @@ int main(int argc, char const* argv[]) {
     } else {
       // Upstream's parse loop ended without an else, so ANY unrecognised token
       // was silently ignored -- including a mistyped safety flag.  A run
-      // launched with "--enable-command-q-clamps" (or with a flag this build
-      // predates) came up looking exactly like a run with the clamp on, which
-      // is the worst possible failure mode for an opt-in safety option.
+      // launched with a misspelled or unsupported safety option must not come
+      // up looking like a guarded run.
       std::cerr << "Error: unknown option: " << argv[i] << std::endl;
       PrintUsage(argv[0]);
       exit(1);
@@ -5760,13 +5914,8 @@ int main(int argc, char const* argv[]) {
     enableMotionRecording,
     initial_compliance,
     initial_max_close_ratio,
-    enableCommandQClamp,
-    simulationStudyDisableCommandQClamp,
-    commandMaxDeltaRad,
-    manualTakeoverAuthorization,
     enableDex3Hands,
-    simulationOnly,
-    hardwareProfile
+    simulationOnly
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   

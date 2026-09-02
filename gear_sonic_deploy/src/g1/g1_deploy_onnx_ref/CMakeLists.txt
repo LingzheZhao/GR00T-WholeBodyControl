@@ -10,6 +10,7 @@ set(MODE5_CONTRACT_GENERATOR
     "${CMAKE_CURRENT_SOURCE_DIR}/tools/generate_mode5_contract.py")
 set(MODE5_CONTRACT_HEADER
     "${CMAKE_CURRENT_SOURCE_DIR}/include/mode5_contract_generated.hpp")
+
 set(SONIC_WBC_ROOT "" CACHE PATH
     "WholeBodyControl checkout used to verify G1 model semantics")
 if(NOT SONIC_WBC_ROOT AND DEFINED ENV{SONIC_WBC_ROOT})
@@ -19,6 +20,7 @@ if(NOT SONIC_WBC_ROOT)
   set(SONIC_WBC_ROOT "${PROJECT_SOURCE_DIR}/..")
 endif()
 get_filename_component(SONIC_WBC_ROOT "${SONIC_WBC_ROOT}" ABSOLUTE)
+
 # Re-run the semantic verifier when generated inputs or active model/config
 # files change. ONNX checkpoints and provenance-only source files are runtime
 # inputs, so replacing them does not invalidate the C++ build.
@@ -218,7 +220,6 @@ else()
 endif()
 
 find_package(Eigen3 REQUIRED)
-find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 
 set(EXE_INCLUDES
   ${CMAKE_CURRENT_SOURCE_DIR}/include/
@@ -251,7 +252,7 @@ target_include_directories(${EXECUTABLE_NAME} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}
 target_link_directories(${EXECUTABLE_NAME} PRIVATE ${CUDA_LINK_DIRS})
 target_link_libraries(
   ${EXECUTABLE_NAME} PRIVATE ${PROJECT_NAME}
-  ${EXE_LIBS} OpenSSL::Crypto
+  ${EXE_LIBS}
 )
 
 # Setting our output directory and C++ standard

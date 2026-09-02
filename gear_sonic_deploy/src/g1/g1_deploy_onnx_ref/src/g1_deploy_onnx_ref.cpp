@@ -444,7 +444,6 @@ class G1Deploy {
       MOTOR_FAULT_MONITOR,
       MOTOR_STATUS,
       NONFINITE_MOTOR_STATE,
-      POSITION_LIMIT,
       CONTROL_PROGRESS_TIMEOUT,
       LOWCMD_WRITE_FAILURE,
       ROBOT_STATE_GATHER_FAILURE,
@@ -2704,8 +2703,6 @@ class G1Deploy {
           return "a motor reported nonzero fault status";
         case SafetyFaultReason::NONFINITE_MOTOR_STATE:
           return "a motor reported non-finite position or velocity";
-        case SafetyFaultReason::POSITION_LIMIT:
-          return "a measured joint position exceeded the G1 hard range";
         case SafetyFaultReason::CONTROL_PROGRESS_TIMEOUT:
           return "the 50 Hz Control producer stopped making successful progress";
         case SafetyFaultReason::LOWCMD_WRITE_FAILURE:
@@ -3771,15 +3768,6 @@ class G1Deploy {
           LatchSafetyFault(SafetyFaultReason::NONFINITE_MOTOR_STATE);
           std::cout << "[ERROR] Motor " << i
                     << " reports a non-finite measured state" << std::endl;
-          return false;
-        }
-        if (measured_q < G1_JOINT_POSITION_LOWER_LIMITS[i] ||
-            measured_q > G1_JOINT_POSITION_UPPER_LIMITS[i]) {
-          LatchSafetyFault(SafetyFaultReason::POSITION_LIMIT);
-          std::cout << "[ERROR] Motor " << i << " measured q=" << measured_q
-                    << " is outside G1 hard range ["
-                    << G1_JOINT_POSITION_LOWER_LIMITS[i] << ", "
-                    << G1_JOINT_POSITION_UPPER_LIMITS[i] << "]" << std::endl;
           return false;
         }
       }

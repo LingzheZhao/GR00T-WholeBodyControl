@@ -178,11 +178,11 @@ bool IsFiniteCommandValue(double value) noexcept {
 // The supervisor that launches this binary cannot see which encoder modes the
 // loaded observation config declares, nor which one ends up in effect after
 // the SONIC_FORCE_ENCODE_MODE override.  That matters because an SMPL deploy
-// bundle carries smpl_joint.csv plus 29 DoF of ZEROS in joint_pos/joint_vel:
-// mode 2 (smpl) reads the SMPL channels, while mode 0 (g1) reads the zeros and
-// quietly commands a straight-legged zero pose at 50 Hz.  Tracking an SMPL
-// bundle under mode 0 is therefore invalid. Launchers can discover the modes
-// offered by the loaded configuration before starting an episode.
+// bundle carries smpl_joint.csv plus a 29-DoF auxiliary block whose wrist
+// columns may be populated for mode 2. Mode 0 would misread that structural
+// mode-2 block as a complete G1 trajectory (usually zero outside the wrists),
+// so tracking an SMPL bundle under mode 0 is invalid. Launchers can discover
+// the modes offered by the loaded configuration before starting an episode.
 //
 // So the controller prints one machine-readable capability line on stdout and
 // refuses any override value it cannot validate against the loaded config.
@@ -283,14 +283,16 @@ std::string BuildSonicCapabilityLine(const std::vector<EncoderModeConfig>& encod
 //
 // std::atoi cannot fail: "smpl", "2x", " " and "" all parse to 0 -- and 0 is
 // exactly the mode that is unsafe for an SMPL bundle, because gathering mode-0
-// observations off the zero-filled joint_pos SUCCEEDS.  A typo in the launcher
-// would therefore silently downgrade an intended SMPL run into a zero-pose
-// command stream.  So require the whole string to be consumed by strtol, and
+// observations off its compatibility joint_pos (normally zero except for
+// optional wrist channels) SUCCEEDS.  A typo in the launcher would therefore
+// silently downgrade an intended SMPL run to the wrong reference stream.  So
+// require the whole string to be consumed by strtol, and
 // require the resulting id to be one of the modes the loaded config declares.
 //
-// Failure aborts the process.  Both callers run at startup, long before DDS,
-// the control threads or any motor command exists, so exiting is the safe
-// outcome: there is no robot state to wind down yet.
+// Failure aborts the process before LowCmd takeover, the control threads, or
+// any actuation. The capability-only path runs before DDS initialization; the
+// normal constructor path has already created its DDS channels but has not
+// released the Unitree motion service or enabled its LowCmd writer.
 std::optional<int> ParseEncoderModeEnv(const char* name,
                                        const std::vector<EncoderModeConfig>& encoder_modes) {
   const char* raw = std::getenv(name);
@@ -557,6 +559,11 @@ class G1Deploy {
       TimestampedData<IMUState_> torso_imu;
     };
 
+    struct ActiveLowCommandSnapshot {
+      TimestampedData<MotorCommand> body_command;
+      std::optional<Dex3Hands::WriteSnapshot> dex3_hands;
+    };
+
     DataBuffer<LowState_> low_state_buffer_;
     DataBuffer<MotorCommand> motor_command_buffer_;
     DataBuffer<IMUState_> imu_torso_buffer_;
@@ -604,8 +611,9 @@ class G1Deploy {
     // =========================================================================
     static constexpr std::chrono::milliseconds LOW_STATE_LATE_THRESHOLD{50};
     static constexpr std::chrono::milliseconds LOW_STATE_ABSENT_THRESHOLD{100};
-    // Armed by the first successful command-producing INIT tick and refreshed
-    // by every subsequent healthy INIT, wait, and policy tick.  The 500 Hz
+    // Armed immediately before the first full-gain INIT command is published
+    // and refreshed by every subsequent healthy INIT, wait, and policy tick.
+    // The 500 Hz
     // writer owns the one-way timeout decision, so a blocked Control thread
     // cannot keep its last full-gain target alive indefinitely.
     sonic::control::ControlProgressWatchdog control_progress_watchdog_;
@@ -2402,16 +2410,16 @@ class G1Deploy {
       int intended_encoder_mode = current_motion_->GetEncodeMode();
 
       // =====================================================================
-      // Fail-closed for encoder mode 2 (smpl): NO fallback.
+      // Fail closed for a declared physical stream contract: NO fallback.
       // =====================================================================
       // Upstream treats a gather failure as "try the other modes until one
       // works".  That is reasonable when every mode is a different view of the
       // same retargeted G1 trajectory, but it is precisely the hazard for
-      // SMPL references.  An SMPL deploy bundle carries smpl_joint.csv plus 29
-      // DoF of ZEROS in joint_pos/joint_vel, so the fallback target -- mode 0
-      // (g1) -- does not fail: it gathers those zeros SUCCESSFULLY and then
-      // commands the robot to a straight-legged zero pose at 50 Hz.  The
-      // fallback is the accident, not the failure that triggered it.
+      // SMPL references. An SMPL deploy bundle carries smpl_joint.csv plus a
+      // 29-DoF auxiliary block whose mode-2 wrist columns may be non-zero.
+      // Mode 0 still gathers that block successfully as if it were a complete
+      // G1 trajectory, producing a mostly-zero, structurally wrong reference.
+      // The fallback is the accident, not the failure that triggered it.
       //
       // Mode 2 is also never reached by accident.  It is only ever intended by
       // explicit selection: the SONIC_FORCE_ENCODE_MODE override (validated
@@ -2421,21 +2429,30 @@ class G1Deploy {
       // the reference data contradicts the operator's explicit intent, and
       // refusing is the only correct answer.
       //
+      // The same rule applies to mode 0 whenever this is a physical runtime or
+      // SONIC_EXPECTED_STREAM_MODE is declared.  Switching observation modes
+      // after a gather failure would violate the exact robot/SMPL kind already
+      // admitted by the launcher even if another mode happened to gather.
+      // Unbound simulation keeps upstream's diagnostic fallback for non-SMPL
+      // modes; it has no declared physical stream identity to preserve.
+      //
       // Returning false is a verified-safe outcome, not a hang: it propagates
       // out of GatherObservations() (~:4045), the control loop sets
-      // operator_state.stop, main()'s run loop exits, and Stop() publishes
-      // CreateDampingCommand() -- a damping shutdown, not a frozen last
-      // command and not a zero-pose command.
-      const bool refuse_mode_fallback = (intended_encoder_mode == 2);
+      // operator_state.stop, main()'s run loop exits, and Stop() latches the
+      // wire-side damping command -- not a frozen last command and not a
+      // zero-pose command.
+      const bool refuse_mode_fallback =
+          !sonic::physical_runtime_safety::EncoderModeFallbackAllowed(
+              simulation_only_, expected_stream_mode_, intended_encoder_mode);
 
       // Build list of modes to try (start with current mode, then all others as fallback)
       std::vector<int> modes_to_try;
 
       if (refuse_mode_fallback) {
         // Exactly one candidate: the intended mode.  Deliberately built
-        // without consulting encoder_config_.encoder_modes, so that even a
-        // config that somehow failed to declare mode 2 cannot cause a silent
-        // downgrade -- it just fails the gather and stops the robot.
+        // without consulting encoder_config_.encoder_modes, so a declared
+        // physical stream contract (or SMPL's non-equivalent compatibility
+        // channel) cannot silently downgrade -- gather failure stops control.
         modes_to_try.push_back(intended_encoder_mode);
       } else if (!encoder_config_.encoder_modes.empty()) {
         // Start with intended mode if valid
@@ -2543,9 +2560,14 @@ class G1Deploy {
         } else {
           // This mode failed - warn if it was the intended mode
           if (current_motion_->GetEncodeMode() == intended_encoder_mode && attempt == 0) {
-            std::cerr << "⚠ Warning: Intended encoder mode " << intended_encoder_mode 
-                      << (!mode_name.empty() ? " ('" + mode_name + "')" : "")
-                      << " failed, trying fallback modes..." << std::endl;
+            std::cerr << "⚠ Warning: Intended encoder mode " << intended_encoder_mode
+                      << (!mode_name.empty() ? " ('" + mode_name + "')" : "");
+            if (refuse_mode_fallback) {
+              std::cerr << " failed; fallback refused by the encoder-mode safety contract"
+                        << std::endl;
+            } else {
+              std::cerr << " failed, trying fallback modes..." << std::endl;
+            }
           }
           
           // Clear buffer and try next mode
@@ -2555,13 +2577,13 @@ class G1Deploy {
       
       // All modes failed
       if (refuse_mode_fallback) {
-        // The single intended mode (2 = smpl) failed and, by design, no other
-        // mode was offered.  Marker on stdout so the supervisor can attribute
-        // the damping stop that follows to a refused downgrade rather than to
-        // a crash.
-        std::cout << "ENCODER_MODE_FALLBACK_REFUSED: intended=2" << std::endl;
+        // The single permitted mode failed and, by design, no other mode was
+        // offered.  Marker on stdout attributes the observation-gather fault
+        // and damping stop to a refused downgrade rather than to a crash.
+        std::cout << "ENCODER_MODE_FALLBACK_REFUSED: intended="
+                  << intended_encoder_mode << std::endl;
       }
-      std::cerr << "✗ Error: All available encoder modes failed to gather observations" << std::endl;
+      std::cerr << "✗ Error: All permitted encoder modes failed to gather observations" << std::endl;
       return false;
     }
 
@@ -3258,11 +3280,19 @@ class G1Deploy {
       // has been written.
       const bool standalone_zmq =
           dynamic_cast<ZMQEndpointInterface*>(input_interface_.get()) != nullptr;
-      if (!simulation_only_ && !standalone_zmq) {
-        throw std::runtime_error(
-            "physical runtime requires --input-type zmq before takeover");
-      }
-      if (!simulation_only_ && !expected_stream_episode_.has_value()) {
+      if (!simulation_only_ &&
+          !sonic::physical_runtime_safety::HasCompletePhysicalStreamBinding(
+              standalone_zmq, expected_stream_mode_,
+              expected_stream_episode_.has_value())) {
+        if (!standalone_zmq) {
+          throw std::runtime_error(
+              "physical runtime requires --input-type zmq before takeover");
+        }
+        if (expected_stream_mode_ < 0) {
+          throw std::runtime_error(
+              "physical runtime requires SONIC_EXPECTED_STREAM_MODE before "
+              "takeover");
+        }
         throw std::runtime_error(
             "physical runtime requires SONIC_EXPECTED_STREAM_EPISODE before "
             "takeover");
@@ -3508,7 +3538,6 @@ class G1Deploy {
         MarkIntentionalShutdownPending();
       }
       operator_state.stop.store(true, std::memory_order_release);
-      CreateDampingCommand();
       low_level_takeover_active_.store(true, std::memory_order_release);
 
       // Synchronous write plus the contract's repeated damping burst from the
@@ -3564,12 +3593,17 @@ class G1Deploy {
       // Publish the CRC-accepted sample and evaluate its identity under the
       // same gate mutex used by final pre-takeover confirmation. A callback
       // cannot decide "not armed" and then publish a mismatch after arming.
+      bool identity_fault_won = false;
       const bool armed_identity_mismatch =
           physical_identity_gate_.PublishAndCheck(
               low_state.mode_machine(), low_state.mode_pr(),
-              [&]() { low_state_buffer_.SetData(low_state); });
+              [&]() { low_state_buffer_.SetData(low_state); },
+              [&]() {
+                identity_fault_won =
+                    LatchSafetyFault(SafetyFaultReason::IDENTITY_DIVERGENCE);
+              });
       if (!simulation_only_ && armed_identity_mismatch) {
-        if (LatchSafetyFault(SafetyFaultReason::IDENTITY_DIVERGENCE)) {
+        if (identity_fault_won) {
           std::cerr << "[SAFETY] LowState identity changed to mode_machine="
                     << unsigned(low_state.mode_machine()) << ", mode_pr="
                     << unsigned(low_state.mode_pr())
@@ -3609,7 +3643,9 @@ class G1Deploy {
      * into a LowCmd_ DDS message with CRC, and publishes via DDS.
      * Also publishes Dex3 hand commands at the same cadence.
      */
-    bool LowCommandWriterLocked(bool intentional_shutdown_requested) {
+    bool LowCommandWriterLocked(
+        bool intentional_shutdown_requested,
+        const std::optional<ActiveLowCommandSnapshot>& command_snapshot) {
       // lowcmd_publish_mutex_ covers the one-way damping latch, command
       // selection, packet packing, and SDK Write(). Once a
       // holder commits force_damping_, no later holder can select an active
@@ -3637,17 +3673,25 @@ class G1Deploy {
       dds_low_command.mode_machine() =
           sonic::mode5_contract::kModeMachine;
 
-      const auto command_snapshot = motor_command_buffer_.GetDataWithTime();
       const bool force_damping = force_damping_.load(std::memory_order_acquire);
       // Before the first safe INIT command, publish damping rather than an
       // empty LowCmd interval after taking ownership from the motion service.
       // This initial fallback is transient; unlike force_damping_, it does not
       // latch and a later safe INIT command may replace it.
-      const bool use_damping = force_damping || !command_snapshot.data;
+      const bool dex3_snapshot_complete =
+          !enable_dex3_hands_ ||
+          (command_snapshot.has_value() &&
+           command_snapshot->dex3_hands.has_value() &&
+           command_snapshot->dex3_hands->HasActiveCommands());
+      const bool active_snapshot_complete =
+          command_snapshot.has_value() && command_snapshot->body_command.data &&
+          dex3_snapshot_complete;
+      const bool use_damping =
+          force_damping || !active_snapshot_complete;
       const MotorCommand damping_command = MakeDampingCommand();
       const MotorCommand* command = use_damping
           ? &damping_command
-          : command_snapshot.data.get();
+          : command_snapshot->body_command.data.get();
 
       bool body_command_written = false;
       if (command) {
@@ -3672,10 +3716,15 @@ class G1Deploy {
       // hand buffers so a late Control() write cannot resurrect an active hand
       // target after shutdown.
       if (enable_dex3_hands_) {
-        if (use_damping) {
+        // A body Write() failure latches force_damping_ above. Re-read it so
+        // that failure cannot be followed by an active hand publication from
+        // the otherwise valid prefetched snapshot.
+        const bool use_hand_damping =
+            use_damping || force_damping_.load(std::memory_order_acquire);
+        if (use_hand_damping) {
           dex3_hands_.writeStopOnce();
         } else {
-          dex3_hands_.writeOnce();
+          dex3_hands_.writeOnce(*command_snapshot->dex3_hands);
         }
       }
 
@@ -3694,16 +3743,42 @@ class G1Deploy {
         MarkIntentionalShutdownPending();
       }
 
-      std::lock_guard<std::mutex> publish_lock(lowcmd_publish_mutex_);
-      if (!intentional_shutdown_requested && IntentionalShutdownRequested()) {
-        // Close the observation race between the first check and mutex entry.
-        MarkIntentionalShutdownPending();
-        intentional_shutdown_requested = true;
-      }
-      if (intentional_shutdown_pending_.load(std::memory_order_acquire)) {
-        intentional_shutdown_requested = true;
-      }
-      return LowCommandWriterLocked(intentional_shutdown_requested);
+      // The body and hand command/state buffers use their own blocking locks.
+      // Never hold the LowCmd publication mutex while acquiring any of them: a
+      // fault callback must be able to win the publication mutex and commit
+      // force_damping_ even if a producer is paused inside SetData(). The final
+      // callback below runs under the publication mutex and therefore must
+      // re-evaluate every damping source.
+      const bool damping_required_before_prefetch =
+          force_damping_.load(std::memory_order_acquire) ||
+          intentional_shutdown_pending_.load(std::memory_order_acquire);
+      return sonic::physical_runtime_safety::
+          PrefetchActiveCommandThenCommitLocked(
+              damping_required_before_prefetch, lowcmd_publish_mutex_,
+              [&]() {
+                ActiveLowCommandSnapshot snapshot;
+                snapshot.body_command =
+                    motor_command_buffer_.GetDataWithTime();
+                if (enable_dex3_hands_) {
+                  snapshot.dex3_hands = dex3_hands_.CaptureWriteSnapshot();
+                }
+                return snapshot;
+              },
+              [&](const auto& command_snapshot) {
+                if (!intentional_shutdown_requested &&
+                    IntentionalShutdownRequested()) {
+                  // Close the observation race between the first check and the
+                  // final serialized publication decision.
+                  MarkIntentionalShutdownPending();
+                  intentional_shutdown_requested = true;
+                }
+                if (intentional_shutdown_pending_.load(
+                        std::memory_order_acquire)) {
+                  intentional_shutdown_requested = true;
+                }
+                return LowCommandWriterLocked(intentional_shutdown_requested,
+                                              command_snapshot);
+              });
     }
 
     /// Gracefully stop all threads and send a damping-only command.
@@ -3719,9 +3794,10 @@ class G1Deploy {
     /// datagram can simply be lost.  So damping must be published MANY times,
     /// which means the 500 Hz LowCommandWriter thread has to still be running
     /// when it is written: joining the threads first (as this used to do) left
-    /// exactly one damping datagram, from the direct call at the end.  Writing
-    /// damping into the buffer and then holding for 250 ms lets the writer
-    /// republish it ~125 times before anything is joined.
+    /// exactly one damping datagram, from the direct call at the end. Latching
+    /// damping and then holding for 250 ms lets the writer republish it ~125
+    /// times before anything is joined, without reading the mutable active
+    /// command buffer.
     void Stop() {
       EmergencyDampingAndJoin();
       // Damping has already reached LowCmd, so diagnostics allocation/copying
@@ -3789,7 +3865,7 @@ class G1Deploy {
       // old loop re-read q on every 50 Hz tick and blended that moving value
       // toward the target, which reduced the effective restoring error early
       // in INIT and let gravity drive lightly loaded joints into their stops.
-      // Latch only after the complete state/limit gate above.
+      // Latch only after the complete state-validity gate above.
       if (!init_start_q_latched_) {
         for (int i = 0; i < G1_NUM_MOTOR; ++i) {
           init_start_q_[i] =
@@ -3832,6 +3908,10 @@ class G1Deploy {
         dex3_hands_.open(false);
         std::cout << "Init Done" << std::endl;
       }
+      // Arm before the first non-damping buffer publication. If this producer
+      // stalls immediately after SetData, the independent 500 Hz writer must
+      // still age out the command instead of repeating it forever.
+      MarkControlProgress();
       motor_command_buffer_.SetData(motor_command_tmp);
       init_command_sent_ = true;
       return true;
@@ -5072,9 +5152,7 @@ class G1Deploy {
 
       switch (program_state_) {
         case ProgramState::INIT:
-          if (InitControl()) {
-            MarkControlProgress();
-          } else if (HasLatchedSafetyFault()) {
+          if (!InitControl() && HasLatchedSafetyFault()) {
             std::cerr << "[SAFETY] INIT aborted after latched safety fault: "
                       << LatchedSafetyFaultReason() << std::endl;
           } else if (!init_command_sent_) {
@@ -5125,6 +5203,13 @@ class G1Deploy {
                       std::chrono::steady_clock::now(),
                       STREAMING_DATA_ABSENT_THRESHOLD,
                       ZMQ_STREAM_STARTUP_GRACE);
+              if (window_state == sonic::physical_runtime_safety::
+                                      AcceptedWindowState::STARTUP_GRACE) {
+                // A just-enabled stream gets one bounded opportunity to
+                // deliver its first accepted exact-episode window. Stay in
+                // WAIT_FOR_CONTROL; CONTROL itself never runs on grace.
+                break;
+              }
               bool streamed_motion_active = false;
               {
                 std::lock_guard<std::mutex> lock(current_motion_mutex_);

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <mutex>
 #include <optional>
+#include <type_traits>
 #include <utility>
 
 #include "mode5_contract_generated.hpp"
@@ -17,6 +18,20 @@ inline constexpr bool MatchesMode5LowStateIdentity(
          mode_pr == mode5_contract::kModePr;
 }
 
+/// Whether an encoder observation-gather failure may try another mode.
+///
+/// A physical runtime, or any runtime with an explicit expected stream mode,
+/// must preserve that declared observation contract and fail closed.  The
+/// unbound simulation path retains upstream's diagnostic fallback for ordinary
+/// robot/teleoperation modes.  SMPL mode 2 remains fail closed even there:
+/// its robot-joint compatibility channel is not an equivalent reference.
+inline constexpr bool EncoderModeFallbackAllowed(
+    bool simulation_only, int expected_stream_mode,
+    int intended_encoder_mode) noexcept {
+  return simulation_only && expected_stream_mode < 0 &&
+         intended_encoder_mode != 2;
+}
+
 /// Serializes publication of CRC-accepted LowState identity with the final
 /// pre-takeover confirmation that arms identity monitoring.
 ///
@@ -26,13 +41,23 @@ inline constexpr bool MatchesMode5LowStateIdentity(
 /// callback can decide "not armed" and publish a mismatch after confirmation.
 class Mode5IdentityGate {
  public:
-  template <typename Publish>
+  template <typename Publish, typename OnMismatch>
   bool PublishAndCheck(std::uint8_t mode_machine, std::uint8_t mode_pr,
-                       Publish&& publish) {
+                       Publish&& publish, OnMismatch&& on_mismatch) {
     std::lock_guard<std::mutex> lock(mutex_);
+    const bool mismatch =
+        armed_ && !MatchesMode5LowStateIdentity(mode_machine, mode_pr);
+    if (mismatch) {
+      // Complete the one-way damping latch before releasing the same mutex
+      // that serializes publication with takeover arming. The arming thread
+      // can never return through a concurrently published mismatch whose
+      // safety action is still pending.
+      std::forward<OnMismatch>(on_mismatch)();
+    }
+    // Before arming, publication lets ArmIf() validate the latest sample.
+    // After arming, a mismatch is made visible only after damping is latched.
     std::forward<Publish>(publish)();
-    return armed_ &&
-           !MatchesMode5LowStateIdentity(mode_machine, mode_pr);
+    return mismatch;
   }
 
   template <typename CurrentSampleIsValid>
@@ -54,6 +79,41 @@ class Mode5IdentityGate {
   mutable std::mutex mutex_;
   bool armed_ = false;
 };
+
+/// Read a mutable active-command source only while active control is still
+/// permitted. A wire-side damping latch must not wait behind a producer that
+/// is stalled while holding the active-command buffer's lock.
+template <typename ReadActiveCommand>
+auto ReadActiveCommandUnlessDamping(bool damping_required,
+                                    ReadActiveCommand&& read_active_command) {
+  using Snapshot =
+      std::decay_t<decltype(std::forward<ReadActiveCommand>(
+          read_active_command)())>;
+  if (damping_required) {
+    return std::optional<Snapshot>{};
+  }
+  return std::optional<Snapshot>{
+      std::forward<ReadActiveCommand>(read_active_command)()};
+}
+
+/// Fetch a potentially blocking active-command snapshot before entering the
+/// mutex that serializes the final damping decision and wire publication.
+///
+/// commit_locked() must re-evaluate every one-way damping source while
+/// commit_mutex is held. A damping latch may win while read_active_command()
+/// is blocked; in that case commit_locked() must discard the prefetched active
+/// snapshot. Keeping the lock acquisition in this helper makes that ordering
+/// directly regression-testable.
+template <typename ReadActiveCommand, typename CommitLocked>
+auto PrefetchActiveCommandThenCommitLocked(
+    bool damping_required_before_prefetch, std::mutex& commit_mutex,
+    ReadActiveCommand&& read_active_command, CommitLocked&& commit_locked) {
+  auto command_snapshot = ReadActiveCommandUnlessDamping(
+      damping_required_before_prefetch,
+      std::forward<ReadActiveCommand>(read_active_command));
+  std::lock_guard<std::mutex> lock(commit_mutex);
+  return std::forward<CommitLocked>(commit_locked)(command_snapshot);
+}
 
 enum class AcceptedWindowState {
   CURRENT,
@@ -90,6 +150,13 @@ inline constexpr bool ReadyForPhysicalControl(
     AcceptedWindowState window_state) noexcept {
   return exact_episode_bound && streamed_motion_active &&
          window_state == AcceptedWindowState::CURRENT;
+}
+
+inline constexpr bool HasCompletePhysicalStreamBinding(
+    bool standalone_zmq, int expected_stream_mode,
+    bool expected_stream_episode_bound) noexcept {
+  return standalone_zmq && expected_stream_mode >= 0 &&
+         expected_stream_episode_bound;
 }
 
 }  // namespace sonic::physical_runtime_safety

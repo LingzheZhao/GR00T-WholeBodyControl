@@ -78,6 +78,7 @@
 
 #include "input_interface.hpp"
 #include "stream_episode.hpp"
+#include "stream_window_readiness.hpp"
 #include "zmq_packed_message_subscriber.hpp"
 #include "streamed_motion_merger.hpp"
 
@@ -198,7 +199,8 @@ public:
     // EncodeModeForProtocolVersion below).  Nothing else in this process gets
     // a vote, so a publisher that streams the wrong kind silently drives the
     // policy off the wrong observations -- and for an SMPL bundle read as
-    // mode 0 that means a straight-legged zero pose at 50 Hz.
+    // mode 0 that means tracking its structurally wrong, mostly-zero 29-DoF
+    // compatibility block (optional wrist channels may be non-zero).
     //
     // The operator can therefore DECLARE what the publisher is supposed to
     // send, and every window that disagrees is dropped before it can replace
@@ -255,16 +257,12 @@ public:
 
     /// Local receipt time of the last packet that completed every wire,
     /// profile, shape, finite-value, ordering, and motion-merge check.
-    /// This deliberately has no stream-enable grace fallback: the physical
-    /// WAIT_FOR_CONTROL gate uses it to prove real streamed bytes are active.
+    /// This deliberately has no stream-enable fallback. WAIT_FOR_CONTROL may
+    /// wait for a separately bounded startup grace, but only this timestamp
+    /// can authorize the transition into physical CONTROL.
     std::optional<std::chrono::steady_clock::time_point>
     GetLastAcceptedUpdateTime() const {
-        const int64_t ticks =
-            last_accepted_ticks_.load(std::memory_order_acquire);
-        if (ticks == 0) return std::nullopt;
-        return std::chrono::steady_clock::time_point(
-            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
-                std::chrono::nanoseconds(ticks)));
+        return accepted_window_readiness_.CurrentAcceptedTime();
     }
 
     /// Local time at which the current streaming epoch was enabled.
@@ -561,7 +559,8 @@ public:
             std::shared_ptr<MotionSequence> new_motion;
             int frame_offset_adjustment = 0;
             bool did_catchup = false;
-            int protocol_version_for_mode_update = -1;
+            sonic::stream_window_readiness::CommitGate::Generation
+                decoded_stream_generation = 0;
             {
                 std::lock_guard<std::mutex> lock(data_mutex_);
                 if (has_new_data_) {
@@ -588,12 +587,23 @@ public:
                             return;
                         }
                         
-                        // Keep robot active
-                        {
-                            std::lock_guard<std::mutex> lock(current_motion_mutex);
-                            external_token_state_.SetData(result.token_data);
-                            has_external_token_state_ = true;
-                            operator_state.play = true; // this should be redundant because the robot never read reference motion
+                        // Publish freshness only after this generation's token
+                        // state is active. A result decoded before a streaming
+                        // reset is discarded without mutating controller input.
+                        const bool committed =
+                            accepted_window_readiness_.CommitAfterActivation(
+                                result.stream_generation, [&]() {
+                                  std::lock_guard<std::mutex> current_lock(
+                                      current_motion_mutex);
+                                  external_token_state_.SetData(
+                                      result.token_data);
+                                  has_external_token_state_ = true;
+                                  operator_state.play = true;
+                                });
+                        if (!committed) {
+                            std::cerr << "[ZMQEndpointInterface] Discarded "
+                                         "token window from stale stream generation"
+                                      << std::endl;
                         }
                         
                         // Skip motion handling and keyboard controls
@@ -625,6 +635,7 @@ public:
                         stream_window_start_ = result.window_start;
                         frame_offset_adjustment = result.frame_offset_adjustment;
                         did_catchup = result.did_catchup_reset;
+                        decoded_stream_generation = result.stream_generation;
                         
                         if constexpr (DEBUG_LOGGING) {
                             int window_end_msg_idx = stream_window_start_ + result.frame_step * (new_motion->timesteps - 1);
@@ -644,48 +655,62 @@ public:
             
             // update streamed_motion_ and current_frame if we have new data
             if (new_motion) {
-                streamed_motion_ = new_motion;
-                
-                // Handle catch-up reset: when window was reset due to large gap, start from beginning
+                bool shifted_past_playback = false;
+                bool clamped_to_window_end = false;
+                int skipped_global_frame = 0;
+                const bool committed =
+                    accepted_window_readiness_.CommitAfterActivation(
+                        decoded_stream_generation, [&]() {
+                          std::lock_guard<std::mutex> current_lock(
+                              current_motion_mutex);
+                          streamed_motion_ = new_motion;
+                          if (did_catchup) {
+                            current_frame = 0;
+                            reinitialize_heading = true;
+                          } else {
+                            // current_frame is the next frame to be consumed.
+                            int adjusted_frame =
+                                current_frame - frame_offset_adjustment;
+                            if (adjusted_frame < 0) {
+                              shifted_past_playback = true;
+                              skipped_global_frame = stream_window_start_ -
+                                  frame_offset_adjustment + current_frame;
+                              adjusted_frame = 0;
+                            } else if (adjusted_frame >=
+                                       streamed_motion_->timesteps) {
+                              clamped_to_window_end = true;
+                              adjusted_frame = streamed_motion_->timesteps > 0
+                                  ? streamed_motion_->timesteps - 1
+                                  : 0;
+                            }
+                            current_frame = adjusted_frame;
+                          }
+                          current_motion = streamed_motion_;
+                          operator_state.play = true;
+                        });
+
+                if (!committed) {
+                    std::cerr << "[ZMQEndpointInterface] Discarded motion "
+                                 "window from stale stream generation"
+                              << std::endl;
+                    return;
+                }
+
+                // Diagnostics run after the small readiness critical section;
+                // the control thread never waits behind terminal I/O.
                 if (did_catchup) {
-                    std::lock_guard<std::mutex> lock(current_motion_mutex);
-                    current_frame = 0;
-                    current_motion = streamed_motion_;  // Assign shared_ptr directly for thread safety
-                    operator_state.play = true; // Auto-play when entering ZMQ mode
-                    reinitialize_heading = true;
-                    
-                    // CONTRACT: the sim supervisor latches this exact line
-                    // (CATCH_UP_MARKER) to know streamed playback restarted at
-                    // the clip's first frame.  Debug-gating it silently broke
-                    // every native sim run; it stays unconditional.
                     std::cout << "[ZMQEndpointInterface] Catch-up: Reset to frame 0 at global frame "
                               << stream_window_start_ << std::endl;
-                } else {
-                    // Normal case: Adjust current_frame to maintain global playback position after window shift
-                    // current_frame represents "the next frame to be read" (not yet consumed)
-                    int adjusted_frame = current_frame - frame_offset_adjustment;
-                    
-                    // Validate the adjustment doesn't cause discontinuities due to clamping
-                    if (adjusted_frame < 0) {
-                        if constexpr (DEBUG_LOGGING) {
-                            std::cout << "[ZMQEndpointInterface] WARNING: Window shifted past playback position. "
-                                      << "Skipping from global frame " << (stream_window_start_ - frame_offset_adjustment + current_frame)
-                                      << " to " << stream_window_start_ << std::endl;
-                        }
-                        adjusted_frame = 0; // Start from beginning of new window
-                    } else if (adjusted_frame >= streamed_motion_->timesteps) {
-                        if constexpr (DEBUG_LOGGING) {
-                            std::cout << "[ZMQEndpointInterface] WARNING: Playback position beyond new window. "
-                                      << "Clamping to last frame." << std::endl;
-                        }
-                        // Safety: ensure we don't set negative frame index if timesteps is 0
-                        adjusted_frame = (streamed_motion_->timesteps > 0) ? (streamed_motion_->timesteps - 1) : 0;
+                } else if constexpr (DEBUG_LOGGING) {
+                    if (shifted_past_playback) {
+                        std::cout << "[ZMQEndpointInterface] WARNING: Window shifted past playback position. "
+                                  << "Skipping from global frame "
+                                  << skipped_global_frame << " to "
+                                  << stream_window_start_ << std::endl;
+                    } else if (clamped_to_window_end) {
+                        std::cout << "[ZMQEndpointInterface] WARNING: Playback position beyond new window. "
+                                  << "Clamping to last frame." << std::endl;
                     }
-                    
-                    std::lock_guard<std::mutex> lock(current_motion_mutex);
-                    current_frame = adjusted_frame;
-                    current_motion = streamed_motion_;  // Assign shared_ptr directly for thread safety
-                    operator_state.play = true; // Auto-play when entering ZMQ mode
                 }
 
                 // Emitted only after the decoded motion is the active motion.
@@ -771,13 +796,13 @@ public:
       // Safety freshness is based only on a locally observed, fully validated
       // and merged packet.  Raw receipt time and publisher timestamps remain
       // diagnostics; malformed traffic cannot keep the controller's streaming
-      // gate open.  The timestamp is atomic so the control thread never waits
-      // behind network decode or terminal logging while deciding whether to
-      // damp.
-      int64_t ticks = last_accepted_ticks_.load(std::memory_order_acquire);
-      if (ticks == 0) {
-        ticks = stream_enabled_ticks_.load(std::memory_order_acquire);
-      }
+      // gate open. The readiness critical section contains only the active
+      // input swap; the control thread never waits behind network decode or
+      // terminal logging while deciding whether to damp.
+      const auto accepted = GetLastAcceptedUpdateTime();
+      if (accepted.has_value()) return accepted;
+      const int64_t ticks =
+          stream_enabled_ticks_.load(std::memory_order_acquire);
       if (ticks == 0) return std::nullopt;
       return std::chrono::steady_clock::time_point(
           std::chrono::duration_cast<std::chrono::steady_clock::duration>(
@@ -917,7 +942,7 @@ private:
         streamed_motion_->ReserveCapacity(15000, 29, 1, 1, 0, 0); // max 15k frames, 29 joints, 1 body, 1 quat
         stream_window_start_ = 0;
         last_receive_time_.reset();
-        last_accepted_ticks_.store(0, std::memory_order_release);
+        accepted_window_readiness_.BeginGeneration();
         last_accepted_frame_start_.reset();
         last_accepted_frame_end_.reset();
         last_accepted_frame_step_.reset();
@@ -940,6 +965,8 @@ private:
         int frame_step = 1;                        ///< Detected stride between frame indices.
         int protocol_version = 0;                  ///< Protocol version from the message (1, 2, or 3).
         std::vector<double> token_data;            ///< Token data from the message.
+        sonic::stream_window_readiness::CommitGate::Generation
+            stream_generation = 0;                 ///< Streaming epoch decoded by this result.
     };
     
     /**
@@ -965,6 +992,8 @@ private:
                                           int old_window_start,
                                           DataBuffer<HeadingState>& heading_state_buffer) {
         DecodeResult result;
+        result.stream_generation =
+            accepted_window_readiness_.CurrentGeneration();
         if (buffered_buffers_.empty()) {
             std::cerr << "[ZMQEndpointInterface] No buffered buffers" << std::endl;
             return result;
@@ -1285,7 +1314,6 @@ private:
             
             // Return success with protocol version but no motion (token-only)
             result.protocol_version = 4;
-            last_accepted_ticks_.store(SafetyTicksNow(), std::memory_order_release);
             return result;
         }
         
@@ -2443,7 +2471,6 @@ private:
             }
         }
         last_decode_time_ = decode_end_time;
-        last_accepted_ticks_.store(SafetyTicksNow(), std::memory_order_release);
 
         return result;
     }
@@ -2546,7 +2573,7 @@ private:
     // ------------------------------------------------------------------
     bool is_localhost_ = true;         ///< True if host_ is localhost (for directly comparing timestamps)
     std::optional<std::chrono::steady_clock::time_point> last_receive_time_{}; ///< Timestamp of last OnPoseDataReceived (ms, monotonic).
-    std::atomic<int64_t> last_accepted_ticks_{0}; ///< Local monotonic nanoseconds of last fully validated and merged packet.
+    sonic::stream_window_readiness::CommitGate accepted_window_readiness_; ///< Generation-bound activation/readiness commit.
     std::atomic<int64_t> stream_enabled_ticks_{0}; ///< Fixed first-packet grace origin; never refreshed by traffic.
     std::atomic<bool> first_validated_window_marker_pending_{false}; ///< One readiness marker per stream-enable generation.
     std::optional<int64_t> last_accepted_frame_start_{}; ///< Replay guard, protected by data_mutex_.

@@ -5,8 +5,9 @@
  * Dex3Hands manages two 7-DOF Dex3 hands via the Unitree DDS channel API.
  * It provides:
  *  - Thread-safe command and state buffers (via DataBuffer).
- *  - `writeOnce()` – called at the user's cadence to publish smoothed
- *    commands with delta-q clamping and close-ratio limiting.
+ *  - `CaptureWriteSnapshot()` / `writeOnce(snapshot)` – capture mutable
+ *    buffers before the wire critical section, then publish smoothed commands
+ *    with delta-q clamping and close-ratio limiting.
  *  - Convenience helpers: `open()`, `close()`, `hold()`, `stop()`.
  *  - Per-joint or all-joint command setters.
  *
@@ -34,6 +35,7 @@
 #define DEX3_HANDS_HPP
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -61,6 +63,23 @@ static constexpr int DEX3_SENSOR_MAX = 9;   ///< Number of sensors per Dex3 hand
 class Dex3Hands
 {
 public:
+    using HandCommand = unitree_hg::msg::dds_::HandCmd_;
+    using HandState = unitree_hg::msg::dds_::HandState_;
+
+    struct WriteSnapshot
+    {
+        std::shared_ptr<const HandCommand> left_command;
+        std::shared_ptr<const HandState> left_state;
+        std::shared_ptr<const HandCommand> right_command;
+        std::shared_ptr<const HandState> right_state;
+        double max_close_ratio = 1.0;
+
+        bool HasActiveCommands() const noexcept
+        {
+            return left_command != nullptr && right_command != nullptr;
+        }
+    };
+
     Dex3Hands() = default;
 
     // Initializes channels for both hands. If networkInterface is empty, skips ChannelFactory init.
@@ -106,22 +125,37 @@ public:
 
     // Set max close ratio at runtime (bounded to [0.2, 1.0])
     void SetMaxCloseRatio(double ratio) {
-        max_close_ratio_ = std::max(0.2, std::min(1.0, ratio));
+        max_close_ratio_.store(
+            std::max(0.2, std::min(1.0, ratio)), std::memory_order_release);
     }
     
     // Get current max close ratio
-    double GetMaxCloseRatio() const { return max_close_ratio_; }
+    double GetMaxCloseRatio() const {
+        return max_close_ratio_.load(std::memory_order_acquire);
+    }
 
-    // Perform one publish tick; call this at your own cadence from the main class/thread.
-    void writeOnce()
+    // Capture every mutable input used by writeOnce(). The owner calls this
+    // before entering its serialized LowCmd publication critical section.
+    WriteSnapshot CaptureWriteSnapshot() const
+    {
+        return WriteSnapshot{
+            left_.cmd_buffer.GetDataWithTime().data,
+            left_.state_buffer.GetDataWithTime().data,
+            right_.cmd_buffer.GetDataWithTime().data,
+            right_.state_buffer.GetDataWithTime().data,
+            max_close_ratio_.load(std::memory_order_acquire),
+        };
+    }
+
+    // Perform one publish tick from an immutable, pre-captured snapshot.
+    void writeOnce(const WriteSnapshot& snapshot)
     {
         constexpr double MAX_DELTA_Q = 0.25;
-        // Use runtime adjustable max_close_ratio_ instead of constexpr
 
         // Left hand publish with smoothing
         {
-            const auto cmdPtr = left_.cmd_buffer.GetDataWithTime().data;
-            const auto statePtr = left_.state_buffer.GetDataWithTime().data;
+            const auto& cmdPtr = snapshot.left_command;
+            const auto& statePtr = snapshot.left_state;
             
             if (left_.publisher && cmdPtr)
             {
@@ -133,7 +167,9 @@ public:
                 for (int i = 0; i < DEX3_MOTOR_MAX; ++i)
                 {
                     double desired_q = cmdPtr->motor_cmd()[i].q();
-                    desired_q = clipToMaxOpen(desired_q, MAX_LIMITS_LEFT[i], MIN_LIMITS_LEFT[i], max_close_ratio_);
+                    desired_q = clipToMaxOpen(
+                        desired_q, MAX_LIMITS_LEFT[i], MIN_LIMITS_LEFT[i],
+                        snapshot.max_close_ratio);
                     smoothedCmd.motor_cmd()[i].q(desired_q);
                 }
                 
@@ -158,8 +194,8 @@ public:
 
         // Right hand publish with smoothing
         {
-            const auto cmdPtr = right_.cmd_buffer.GetDataWithTime().data;
-            const auto statePtr = right_.state_buffer.GetDataWithTime().data;
+            const auto& cmdPtr = snapshot.right_command;
+            const auto& statePtr = snapshot.right_state;
             
             if (right_.publisher && cmdPtr)
             {
@@ -171,7 +207,9 @@ public:
                 for (int i = 0; i < DEX3_MOTOR_MAX; ++i)
                 {
                     double desired_q = cmdPtr->motor_cmd()[i].q();
-                    desired_q = clipToMaxOpen(desired_q, MAX_LIMITS_RIGHT[i], MIN_LIMITS_RIGHT[i], max_close_ratio_);
+                    desired_q = clipToMaxOpen(
+                        desired_q, MAX_LIMITS_RIGHT[i], MIN_LIMITS_RIGHT[i],
+                        snapshot.max_close_ratio);
                     smoothedCmd.motor_cmd()[i].q(desired_q);
                 }
                 
@@ -472,7 +510,7 @@ private:
     // Runtime adjustable max close ratio (default 1.0 = fully closed allowed)
     // Bounded to [0.2, 1.0] - higher values allow more closing
     // Use --max-close-ratio arg to set initial limit, X/C keys to adjust at runtime
-    double max_close_ratio_ = 1.0;
+    std::atomic<double> max_close_ratio_{1.0};
 
     // Limits taken from Unitree example for test "close" pose
     static constexpr std::array<double, DEX3_MOTOR_MAX> MAX_LIMITS_LEFT  = { 1.05,  1.05,  1.75,  0.0,  0.0,  0.0,  0.0 };

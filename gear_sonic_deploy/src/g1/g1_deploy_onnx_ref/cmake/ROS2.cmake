@@ -97,30 +97,30 @@ message(STATUS "✅ ROS2 configuration: ${ROS2_LIB_COUNT} libraries discovered")
 # ROS2 Test Executable
 # =============================================================================
 
-set(TEST_EXECUTABLE_NAME test_ros2)
-add_executable(${TEST_EXECUTABLE_NAME} tests/test_ros2.cpp)
+if(BUILD_TESTING)
+  set(TEST_EXECUTABLE_NAME test_ros2)
+  add_executable(${TEST_EXECUTABLE_NAME} tests/test_ros2.cpp)
 
-target_include_directories(${TEST_EXECUTABLE_NAME} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include/)
-target_include_directories(${TEST_EXECUTABLE_NAME} PRIVATE ${ROS2_INCLUDE_DIRS})
-target_link_libraries(${TEST_EXECUTABLE_NAME} PRIVATE ${ROS2_LIBS} pthread)
-target_compile_definitions(${TEST_EXECUTABLE_NAME} PRIVATE HAS_ROS2=1)
+  target_include_directories(${TEST_EXECUTABLE_NAME} PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include/)
+  target_include_directories(${TEST_EXECUTABLE_NAME} PRIVATE ${ROS2_INCLUDE_DIRS})
+  target_link_libraries(${TEST_EXECUTABLE_NAME} PRIVATE ${ROS2_LIBS} pthread)
+  target_compile_definitions(${TEST_EXECUTABLE_NAME} PRIVATE HAS_ROS2=1)
 
-set_target_properties(${TEST_EXECUTABLE_NAME} PROPERTIES 
-  RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
-  OUTPUT_NAME ${TEST_EXECUTABLE_NAME}
-)
+  set_target_properties(${TEST_EXECUTABLE_NAME} PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
+    OUTPUT_NAME ${TEST_EXECUTABLE_NAME}
+  )
 
-message(STATUS "✅ ROS2 test executable configured")
+  message(STATUS "✅ ROS2 test executable configured")
 
-# =============================================================================
-# Test Configuration Files
-# =============================================================================
+  # Keep the test-only runtime profile out of production-only builds. The
+  # source profile remains available to the ROS2 deployment scripts.
+  file(MAKE_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/config")
+  configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/config/fastrtps_profile.xml"
+    "${PROJECT_SOURCE_DIR}/target/release/config/fastrtps_profile.xml"
+    COPYONLY
+  )
 
-file(MAKE_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/config")
-configure_file(
-  "${CMAKE_CURRENT_SOURCE_DIR}/config/fastrtps_profile.xml"
-  "${PROJECT_SOURCE_DIR}/target/release/config/fastrtps_profile.xml"
-  COPYONLY
-)
-
-message(STATUS "✅ FastRTPS profile copied for test deployment")
+  message(STATUS "✅ FastRTPS profile copied for test deployment")
+endif()

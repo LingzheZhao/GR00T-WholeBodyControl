@@ -38,6 +38,7 @@
 #include <iomanip>
 #include <filesystem>
 #include <regex>
+#include <stdexcept>
 
 #include "../include/fk.hpp"
 #include "../include/policy_parameters.hpp"
@@ -129,15 +130,57 @@ struct MotionSequence {
 
     void ComputeFK(const RobotFK &fk)
     {
-      if(positions_world_tmp.size() != positions_world_tmp.size())
-      {
-        std::cout << "failed to compute fk - wrong number of joints" << std::endl;
-        std::cerr << positions_world_tmp.size() << " != " << positions_world_tmp.size() << std::endl;
-        return;
+      const int joint_count = GetNumJoints();
+      const int body_count = GetNumBodies();
+      const int quaternion_count = GetNumBodyQuaternions();
+      const auto fk_node_count = static_cast<size_t>(fk.NumJoints());
+      if (joint_count < 0 ||
+          static_cast<size_t>(joint_count) + 1 != fk_node_count ||
+          positions_world_tmp.size() != fk_node_count ||
+          rotations_world_tmp.size() != fk_node_count) {
+        throw std::invalid_argument(
+            "MotionSequence joint count/scratch storage does not match RobotFK");
+      }
+      if (body_count < 0 || quaternion_count < 0 ||
+          body_part_indexes.empty() ||
+          static_cast<size_t>(body_count) != body_part_indexes.size() ||
+          static_cast<size_t>(quaternion_count) != body_part_indexes.size()) {
+        throw std::invalid_argument(
+            "MotionSequence body streams do not match body_part_indexes");
+      }
+      // Body stream slot zero supplies the floating-base pose passed to DoFK.
+      // Refuse a missing or reordered root instead of silently treating some
+      // articulated link pose as the root of the whole kinematic tree.
+      if (body_part_indexes.front() != 0) {
+        throw std::invalid_argument(
+            "MotionSequence body_part_indexes must begin with the root node");
+      }
+      for (const int body_index : body_part_indexes) {
+        if (body_index < 0 ||
+            body_index > static_cast<int>(mujoco_to_isaaclab.size())) {
+          throw std::invalid_argument(
+              "MotionSequence body_part_indexes contains an invalid node");
+        }
+      }
+      if (timesteps < 0) {
+        throw std::invalid_argument(
+            "MotionSequence timesteps must not be negative");
+      }
+      const size_t frame_count = static_cast<size_t>(timesteps);
+      const auto has_frame_storage = [frame_count](size_t stored,
+                                                   size_t stride) {
+        return stride != 0 && frame_count <= stored / stride;
+      };
+      if (!has_frame_storage(joint_positions_.size(),
+                             static_cast<size_t>(joint_count)) ||
+          !has_frame_storage(body_positions_.size(),
+                             static_cast<size_t>(body_count)) ||
+          !has_frame_storage(body_quaternions_.size(),
+                             static_cast<size_t>(quaternion_count))) {
+        throw std::invalid_argument(
+            "MotionSequence timesteps exceed FK input/output backing storage");
       }
 
-      int nframes = timesteps;
-      auto nj = GetNumJoints();
       for( int f=0; f < timesteps; ++f )
       {
         fk.DoFK(

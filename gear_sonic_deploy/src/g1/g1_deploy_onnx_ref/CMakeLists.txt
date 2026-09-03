@@ -187,36 +187,38 @@ endif()
 # Add ZMQ to main executable
 message(STATUS "✅ ZMQ support enabled for main executable")
 
-# Build ZMQ tests
-if(ZMQ_INCLUDE_DIR AND ZMQ_LIBRARY)
-  add_executable(zmq_pose_subscriber_test
-    ${CMAKE_CURRENT_SOURCE_DIR}/tests/zmq_pose_subscriber_test.cpp)
-  target_include_directories(zmq_pose_subscriber_test PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${ZMQ_INCLUDE_DIR})
-  target_link_libraries(zmq_pose_subscriber_test PRIVATE ${ZMQ_LIBRARY})
-  set_target_properties(zmq_pose_subscriber_test PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
-    CXX_STANDARD 20
-    CXX_STANDARD_REQUIRED ON
-    CXX_EXTENSIONS OFF)
-  message(STATUS "✅ Added zmq_pose_subscriber_test (ZMQ found)")
-  
-  # Test for connecting to Python pose estimation server
-  add_executable(zmq_python_sender_test
-    ${CMAKE_CURRENT_SOURCE_DIR}/tests/zmq_python_sender_test.cpp)
-  target_include_directories(zmq_python_sender_test PRIVATE
-    ${CMAKE_CURRENT_SOURCE_DIR}/include
-    ${ZMQ_INCLUDE_DIR})
-  target_link_libraries(zmq_python_sender_test PRIVATE ${ZMQ_LIBRARY})
-  set_target_properties(zmq_python_sender_test PROPERTIES
-    RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
-    CXX_STANDARD 20
-    CXX_STANDARD_REQUIRED ON
-    CXX_EXTENSIONS OFF)
-  message(STATUS "✅ Added zmq_python_sender_test (ZMQ found)")
-else()
-  message(WARNING "⚠️  libzmq not found - skipping zmq_pose_subscriber_test")
+# Build manual ZMQ integration tests only for test-enabled builds.
+if(BUILD_TESTING)
+  if(ZMQ_INCLUDE_DIR AND ZMQ_LIBRARY)
+    add_executable(zmq_pose_subscriber_test
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/zmq_pose_subscriber_test.cpp)
+    target_include_directories(zmq_pose_subscriber_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include
+      ${ZMQ_INCLUDE_DIR})
+    target_link_libraries(zmq_pose_subscriber_test PRIVATE ${ZMQ_LIBRARY})
+    set_target_properties(zmq_pose_subscriber_test PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
+      CXX_STANDARD 20
+      CXX_STANDARD_REQUIRED ON
+      CXX_EXTENSIONS OFF)
+    message(STATUS "✅ Added zmq_pose_subscriber_test (ZMQ found)")
+
+    # Test for connecting to Python pose estimation server
+    add_executable(zmq_python_sender_test
+      ${CMAKE_CURRENT_SOURCE_DIR}/tests/zmq_python_sender_test.cpp)
+    target_include_directories(zmq_python_sender_test PRIVATE
+      ${CMAKE_CURRENT_SOURCE_DIR}/include
+      ${ZMQ_INCLUDE_DIR})
+    target_link_libraries(zmq_python_sender_test PRIVATE ${ZMQ_LIBRARY})
+    set_target_properties(zmq_python_sender_test PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
+      CXX_STANDARD 20
+      CXX_STANDARD_REQUIRED ON
+      CXX_EXTENSIONS OFF)
+    message(STATUS "✅ Added zmq_python_sender_test (ZMQ found)")
+  else()
+    message(WARNING "⚠️  libzmq not found - skipping zmq_pose_subscriber_test")
+  endif()
 endif()
 
 find_package(Eigen3 REQUIRED)
@@ -280,35 +282,39 @@ else()
   message(STATUS "ROS2 not found - building without ROS2InputHandler support")
 endif()
 
-# test executable:
-include(FetchContent)
+if(BUILD_TESTING)
+  # test executable:
+  include(FetchContent)
 
-# Prefer an installed GoogleTest so safety builds can remain network-isolated.
-# Fall back to the pinned source archive only in developer environments that do
-# not provide a package.
-find_package(GTest 1.14 QUIET)
-if(NOT GTest_FOUND)
-  FetchContent_Declare(
-    googletest
-    URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
-    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
-  FetchContent_MakeAvailable(googletest)
+  # Prefer an installed GoogleTest so safety builds can remain network-isolated.
+  # Fall back to the pinned source archive only in developer environments that
+  # do not provide a package.
+  find_package(GTest 1.14 QUIET)
+  if(NOT GTest_FOUND)
+    FetchContent_Declare(
+      googletest
+      URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
+      DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+    FetchContent_MakeAvailable(googletest)
+  endif()
+
+  file(GLOB_RECURSE TEST_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/*.cpp)
+
+  add_executable(run_tests ${TEST_SRCS})
+  target_link_directories(run_tests PRIVATE ${CUDA_LINK_DIRS})
+  target_link_libraries(run_tests GTest::GTest GTest::Main ${EXE_LIBS})
+  target_include_directories(run_tests PUBLIC ${EXE_INCLUDES})
+  target_compile_definitions(
+    run_tests PRIVATE SONIC_WBC_ROOT="${SONIC_WBC_ROOT}")
+
+  # Setting our output directory and C++ standard
+  set_target_properties(
+    run_tests
+    PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
+               OUTPUT_NAME run_tests
+               CXX_STANDARD 20
+               CXX_STANDARD_REQUIRED ON
+               CXX_EXTENSIONS OFF)
+
+  add_test(NAME g1_deploy_unit_tests COMMAND run_tests)
 endif()
-
-file(GLOB_RECURSE TEST_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/unit_tests/*.cpp)
-
-add_executable(run_tests ${TEST_SRCS})
-target_link_directories(run_tests PRIVATE ${CUDA_LINK_DIRS})
-target_link_libraries(run_tests GTest::GTest GTest::Main ${EXE_LIBS})
-target_include_directories(run_tests PUBLIC ${EXE_INCLUDES})
-target_compile_definitions(
-  run_tests PRIVATE SONIC_WBC_ROOT="${SONIC_WBC_ROOT}")
-
-# Setting our output directory and C++ standard
-set_target_properties(
-  run_tests
-  PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${PROJECT_SOURCE_DIR}/target/release/"
-             OUTPUT_NAME run_tests
-             CXX_STANDARD 20
-             CXX_STANDARD_REQUIRED ON
-             CXX_EXTENSIONS OFF)

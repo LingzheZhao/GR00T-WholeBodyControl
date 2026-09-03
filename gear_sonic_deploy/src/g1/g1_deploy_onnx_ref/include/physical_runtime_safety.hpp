@@ -2,8 +2,8 @@
 #define SONIC_G1_PHYSICAL_RUNTIME_SAFETY_HPP
 
 #include <algorithm>
+#include <bit>
 #include <chrono>
-#include <cmath>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -13,6 +13,23 @@
 #include "mode5_contract_generated.hpp"
 
 namespace sonic::physical_runtime_safety {
+
+/// Finite check that survives -ffast-math.
+///
+/// The deploy build sets -O3 -ffast-math globally (top-level CMakeLists.txt),
+/// which implies -ffinite-math-only: the compiler is then entitled to assume
+/// no NaN or Inf ever occurs and may fold std::isfinite() to true and
+/// std::isnan() to false.  Any safety check written with those would be
+/// silently compiled away.  Inspecting the IEEE-754 exponent bits is not
+/// subject to that assumption, so command safety still fails closed on
+/// non-finite policy output and CLI values.
+///
+/// This is the same technique as, and the single definition behind,
+/// IsFiniteCommandValue() in g1_deploy_onnx_ref.cpp.
+inline bool IsFiniteCommandValue(double value) noexcept {
+  constexpr std::uint64_t kExponentMask = UINT64_C(0x7ff0000000000000);
+  return (std::bit_cast<std::uint64_t>(value) & kExponentMask) != kExponentMask;
+}
 
 inline constexpr bool MatchesMode5LowStateIdentity(
     std::uint8_t mode_machine, std::uint8_t mode_pr) noexcept {
@@ -28,10 +45,13 @@ inline constexpr bool MatchesMode5LowStateIdentity(
 /// gear slip leaves no commanded-side evidence at all, so this predicate is
 /// the only check on measured travel.
 ///
-/// A NaN measurement returns false: a non-finite state is not "outside the
-/// range", it is unusable, and it has its own fault reason.  Callers must run
-/// their non-finite check FIRST.  That ordering dependency is regression
-/// tested in unit_tests/test_physical_runtime_safety.cpp.
+/// Defined for FINITE input only.  Callers must run IsFiniteCommandValue()
+/// first: a non-finite measurement is not "outside the range", it is unusable,
+/// and it has its own fault reason (NONFINITE_MOTOR_STATE).  Under
+/// -ffast-math the compiler may assume no NaN reaches these comparisons, so
+/// this predicate must not be relied on to classify one.  That ordering
+/// dependency is regression tested in
+/// unit_tests/test_physical_runtime_safety.cpp.
 inline constexpr bool MeasuredPositionOutsideHardRange(
     double measured_q, double lower_limit, double upper_limit) noexcept {
   return measured_q < lower_limit || measured_q > upper_limit;
@@ -55,12 +75,16 @@ inline constexpr bool MeasuredPositionOutsideHardRange(
 inline double LimitCommandStep(double desired_q,
                                std::optional<double> previous_executed_q,
                                double max_delta_rad) noexcept {
-  if (!(max_delta_rad > 0.0) || !std::isfinite(max_delta_rad) ||
+  if (!IsFiniteCommandValue(max_delta_rad) || !(max_delta_rad > 0.0) ||
       !previous_executed_q.has_value()) {
     return desired_q;
   }
   const double previous = *previous_executed_q;
-  if (!std::isfinite(previous) || !std::isfinite(desired_q)) {
+  // Non-finite operands are passed through untouched so the caller's own
+  // non-finite rejection still sees them.  std::clamp() with a NaN-derived
+  // bound would otherwise hand back an arbitrary finite value and mask the
+  // very condition CreatePolicyCommand() refuses to publish.
+  if (!IsFiniteCommandValue(previous) || !IsFiniteCommandValue(desired_q)) {
     return desired_q;
   }
   return std::clamp(desired_q, previous - max_delta_rad,

@@ -167,9 +167,13 @@ namespace {
 // This target is compiled with -ffast-math, under which std::isfinite may be
 // folded to true.  Inspect IEEE-754 exponent bits so explicitly enabled
 // command safety still fails closed on NaN/Inf policy output and CLI values.
+//
+// The definition lives in physical_runtime_safety.hpp so that header-side
+// safety helpers share one finite check with this translation unit instead of
+// re-deriving it; a second copy is a second thing that can be written with
+// std::isfinite by mistake.
 bool IsFiniteCommandValue(double value) noexcept {
-  constexpr uint64_t kExponentMask = UINT64_C(0x7ff0000000000000);
-  return (std::bit_cast<uint64_t>(value) & kExponentMask) != kExponentMask;
+  return sonic::physical_runtime_safety::IsFiniteCommandValue(value);
 }
 
 // ===========================================================================
@@ -5793,7 +5797,8 @@ int main(int argc, char const* argv[]) {
           // A non-finite or non-positive bound would read as "enabled" on the
           // command line while bounding nothing. Refuse rather than come up
           // looking guarded.
-          if (!std::isfinite(commandMaxDeltaRad) || commandMaxDeltaRad <= 0.0) {
+          if (!IsFiniteCommandValue(commandMaxDeltaRad) ||
+              commandMaxDeltaRad <= 0.0) {
             std::cerr << "Error: --command-max-delta-rad must be a finite "
                          "positive value in radians"
                       << std::endl;

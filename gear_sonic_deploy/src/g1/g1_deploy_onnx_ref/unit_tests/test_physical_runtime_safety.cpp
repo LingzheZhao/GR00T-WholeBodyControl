@@ -383,13 +383,34 @@ TEST(PhysicalRuntimeSafety, MeasuredPositionRangeIsInclusiveAtBothLimits) {
 // The controller must run its non-finite check BEFORE this predicate: NaN is
 // reported as NONFINITE_MOTOR_STATE, not as a range violation. If this
 // expectation ever flips, the caller ordering in CheckSafety() is wrong.
-TEST(PhysicalRuntimeSafety, MeasuredPositionRangeTreatsNaNAsNotOutOfRange) {
-  EXPECT_FALSE(safety::MeasuredPositionOutsideHardRange(
-      std::numeric_limits<double>::quiet_NaN(), -1.0, 1.0));
-  EXPECT_TRUE(safety::MeasuredPositionOutsideHardRange(
-      std::numeric_limits<double>::infinity(), -1.0, 1.0));
-  EXPECT_TRUE(safety::MeasuredPositionOutsideHardRange(
-      -std::numeric_limits<double>::infinity(), -1.0, 1.0));
+TEST(PhysicalRuntimeSafety, MeasuredPositionRangeDefersNonFiniteToTheCaller) {
+  // The range predicate is defined for finite input only, and the caller
+  // guarantees that with IsFiniteCommandValue().  This asserts the property
+  // the caller actually depends on -- that a non-finite measurement is
+  // classified by the finite check, not by the range check -- rather than
+  // asserting comparison behaviour that -ffast-math is free to reorder.
+  const double nan_value = std::numeric_limits<double>::quiet_NaN();
+  const double inf_value = std::numeric_limits<double>::infinity();
+  EXPECT_FALSE(safety::IsFiniteCommandValue(nan_value));
+  EXPECT_FALSE(safety::IsFiniteCommandValue(inf_value));
+  EXPECT_FALSE(safety::IsFiniteCommandValue(-inf_value));
+  EXPECT_TRUE(safety::IsFiniteCommandValue(0.0));
+  EXPECT_TRUE(safety::IsFiniteCommandValue(-1.0));
+}
+
+// The finite check must not be written with std::isfinite/std::isnan: this
+// target is built with -O3 -ffast-math, which lets the compiler assume no
+// non-finite value exists and fold those to a constant. This test fails on a
+// build where that regression is reintroduced.
+TEST(PhysicalRuntimeSafety, FiniteCheckSurvivesFastMath) {
+  volatile double hidden_nan = 0.0;
+  volatile double hidden_zero = 0.0;
+  hidden_nan = hidden_nan / hidden_zero;  // NaN the optimizer cannot fold away
+  EXPECT_FALSE(safety::IsFiniteCommandValue(hidden_nan));
+
+  volatile double hidden_one = 1.0;
+  const double hidden_inf = hidden_one / hidden_zero;
+  EXPECT_FALSE(safety::IsFiniteCommandValue(hidden_inf));
 }
 
 TEST(PhysicalRuntimeSafety, CommandStepLimitIsDisabledByNonPositiveBound) {
@@ -433,8 +454,12 @@ TEST(PhysicalRuntimeSafety, CommandStepLimitCanStillLandOutsideTheHardRange) {
 TEST(PhysicalRuntimeSafety, CommandStepLimitLeavesNonFiniteTargetsToTheCaller) {
   // Non-finite raw targets are rejected by CreatePolicyCommand() before the
   // limiter is consulted; the limiter must not manufacture a finite value that
-  // would mask them.
+  // would mask them.  Asserted with the bit-level finite check, because
+  // std::isnan() is foldable to false under this target's -ffast-math.
   const double nan_value = std::numeric_limits<double>::quiet_NaN();
-  EXPECT_TRUE(std::isnan(safety::LimitCommandStep(nan_value, 0.0, 0.4)));
+  EXPECT_FALSE(safety::IsFiniteCommandValue(
+      safety::LimitCommandStep(nan_value, 0.0, 0.4)));
+  // A non-finite PREVIOUS target must not drag a good desired target into a
+  // clamp against NaN-derived bounds.
   EXPECT_DOUBLE_EQ(safety::LimitCommandStep(5.0, nan_value, 0.4), 5.0);
 }

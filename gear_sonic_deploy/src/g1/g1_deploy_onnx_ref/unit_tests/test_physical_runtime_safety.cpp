@@ -3,10 +3,13 @@
 #include "../include/dex3_hands.hpp"
 #include "../include/physical_runtime_safety.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <future>
+#include <limits>
 #include <mutex>
 #include <optional>
 
@@ -358,4 +361,80 @@ TEST(PhysicalRuntimeSafety, PhysicalStreamBindingRequiresZmqModeAndEpisode) {
   EXPECT_FALSE(safety::HasCompletePhysicalStreamBinding(false, 0, true));
   EXPECT_FALSE(safety::HasCompletePhysicalStreamBinding(true, -1, true));
   EXPECT_FALSE(safety::HasCompletePhysicalStreamBinding(true, 0, false));
+}
+
+// ---------------------------------------------------------------------------
+// Opt-in physical-safety controls: measured joint-position range and per-step
+// command envelope. Both default OFF in the controller; these tests cover the
+// pure decision logic, not the flag plumbing.
+// ---------------------------------------------------------------------------
+
+TEST(PhysicalRuntimeSafety, MeasuredPositionRangeIsInclusiveAtBothLimits) {
+  EXPECT_FALSE(safety::MeasuredPositionOutsideHardRange(0.0, -1.0, 1.0));
+  // A joint resting exactly on a limit has not exceeded it.
+  EXPECT_FALSE(safety::MeasuredPositionOutsideHardRange(-1.0, -1.0, 1.0));
+  EXPECT_FALSE(safety::MeasuredPositionOutsideHardRange(1.0, -1.0, 1.0));
+  EXPECT_TRUE(safety::MeasuredPositionOutsideHardRange(
+      std::nextafter(-1.0, -2.0), -1.0, 1.0));
+  EXPECT_TRUE(safety::MeasuredPositionOutsideHardRange(
+      std::nextafter(1.0, 2.0), -1.0, 1.0));
+}
+
+// The controller must run its non-finite check BEFORE this predicate: NaN is
+// reported as NONFINITE_MOTOR_STATE, not as a range violation. If this
+// expectation ever flips, the caller ordering in CheckSafety() is wrong.
+TEST(PhysicalRuntimeSafety, MeasuredPositionRangeTreatsNaNAsNotOutOfRange) {
+  EXPECT_FALSE(safety::MeasuredPositionOutsideHardRange(
+      std::numeric_limits<double>::quiet_NaN(), -1.0, 1.0));
+  EXPECT_TRUE(safety::MeasuredPositionOutsideHardRange(
+      std::numeric_limits<double>::infinity(), -1.0, 1.0));
+  EXPECT_TRUE(safety::MeasuredPositionOutsideHardRange(
+      -std::numeric_limits<double>::infinity(), -1.0, 1.0));
+}
+
+TEST(PhysicalRuntimeSafety, CommandStepLimitIsDisabledByNonPositiveBound) {
+  // The envelope is opt-in: an absent or meaningless bound passes the target
+  // through rather than silently bounding it to something.
+  EXPECT_EQ(safety::LimitCommandStep(5.0, 0.0, 0.0), 5.0);
+  EXPECT_EQ(safety::LimitCommandStep(5.0, 0.0, -0.4), 5.0);
+  EXPECT_EQ(safety::LimitCommandStep(
+                5.0, 0.0, std::numeric_limits<double>::quiet_NaN()),
+            5.0);
+}
+
+TEST(PhysicalRuntimeSafety, CommandStepLimitPassesThroughWithoutAReference) {
+  // Empty only before INIT has published its first command. The CONTROL path
+  // always has a previous wire target, so this is the defensive case.
+  EXPECT_EQ(safety::LimitCommandStep(5.0, std::nullopt, 0.4), 5.0);
+}
+
+TEST(PhysicalRuntimeSafety, CommandStepLimitBoundsTheStepNotTheRange) {
+  EXPECT_DOUBLE_EQ(safety::LimitCommandStep(1.0, 0.0, 0.4), 0.4);
+  EXPECT_DOUBLE_EQ(safety::LimitCommandStep(-1.0, 0.0, 0.4), -0.4);
+  // A step exactly at the bound is permitted unchanged.
+  EXPECT_DOUBLE_EQ(safety::LimitCommandStep(0.4, 0.0, 0.4), 0.4);
+  EXPECT_DOUBLE_EQ(safety::LimitCommandStep(-0.4, 0.0, 0.4), -0.4);
+  // Anything inside the bound is untouched.
+  EXPECT_DOUBLE_EQ(safety::LimitCommandStep(0.1, 0.0, 0.4), 0.1);
+}
+
+// The limiter bounds distance travelled per step, which says nothing about
+// where that step lands. CreatePolicyCommand() therefore clamps to the hard
+// joint range AFTER limiting; this documents why that order is required.
+TEST(PhysicalRuntimeSafety, CommandStepLimitCanStillLandOutsideTheHardRange) {
+  constexpr double kUpperLimit = 1.0;
+  const double previous = 0.9;
+  const double limited = safety::LimitCommandStep(5.0, previous, 0.4);
+  EXPECT_DOUBLE_EQ(limited, 1.3);
+  EXPECT_GT(limited, kUpperLimit);
+  EXPECT_DOUBLE_EQ(std::clamp(limited, -kUpperLimit, kUpperLimit), kUpperLimit);
+}
+
+TEST(PhysicalRuntimeSafety, CommandStepLimitLeavesNonFiniteTargetsToTheCaller) {
+  // Non-finite raw targets are rejected by CreatePolicyCommand() before the
+  // limiter is consulted; the limiter must not manufacture a finite value that
+  // would mask them.
+  const double nan_value = std::numeric_limits<double>::quiet_NaN();
+  EXPECT_TRUE(std::isnan(safety::LimitCommandStep(nan_value, 0.0, 0.4)));
+  EXPECT_DOUBLE_EQ(safety::LimitCommandStep(5.0, nan_value, 0.4), 5.0);
 }

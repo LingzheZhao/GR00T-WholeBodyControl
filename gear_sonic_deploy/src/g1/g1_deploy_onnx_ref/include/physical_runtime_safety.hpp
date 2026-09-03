@@ -1,7 +1,9 @@
 #ifndef SONIC_G1_PHYSICAL_RUNTIME_SAFETY_HPP
 #define SONIC_G1_PHYSICAL_RUNTIME_SAFETY_HPP
 
+#include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <mutex>
 #include <optional>
@@ -16,6 +18,53 @@ inline constexpr bool MatchesMode5LowStateIdentity(
     std::uint8_t mode_machine, std::uint8_t mode_pr) noexcept {
   return mode_machine == mode5_contract::kModeMachine &&
          mode_pr == mode5_contract::kModePr;
+}
+
+/// Whether a measured joint position has left the G1 hard range.
+///
+/// The commanded-target clamp in CreatePolicyCommand() bounds what the
+/// controller asks for; it says nothing about where the robot actually is.  A
+/// joint driven past its hard limit by an external push, by gravity, or by a
+/// gear slip leaves no commanded-side evidence at all, so this predicate is
+/// the only check on measured travel.
+///
+/// A NaN measurement returns false: a non-finite state is not "outside the
+/// range", it is unusable, and it has its own fault reason.  Callers must run
+/// their non-finite check FIRST.  That ordering dependency is regression
+/// tested in unit_tests/test_physical_runtime_safety.cpp.
+inline constexpr bool MeasuredPositionOutsideHardRange(
+    double measured_q, double lower_limit, double upper_limit) noexcept {
+  return measured_q < lower_limit || measured_q > upper_limit;
+}
+
+/// Bound one control step to `max_delta_rad` around the previously executed
+/// wire target.
+///
+/// `max_delta_rad <= 0`, or a non-finite bound, means the limiter is disabled
+/// and the desired target passes through unchanged: the control is opt-in.
+///
+/// `previous_executed_q` is empty only before INIT has published its first
+/// command.  The CONTROL path never sees that -- INIT always publishes a ramp
+/// target first -- but with no reference there is nothing to bound against, so
+/// the desired target passes through.
+///
+/// This is a step bound, NOT a range bound.  A bounded step taken from a
+/// previous target that already sits near a hard limit can still land outside
+/// it, so callers must clamp the result to the hard joint range AFTER
+/// limiting, never before.
+inline double LimitCommandStep(double desired_q,
+                               std::optional<double> previous_executed_q,
+                               double max_delta_rad) noexcept {
+  if (!(max_delta_rad > 0.0) || !std::isfinite(max_delta_rad) ||
+      !previous_executed_q.has_value()) {
+    return desired_q;
+  }
+  const double previous = *previous_executed_q;
+  if (!std::isfinite(previous) || !std::isfinite(desired_q)) {
+    return desired_q;
+  }
+  return std::clamp(desired_q, previous - max_delta_rad,
+                    previous + max_delta_rad);
 }
 
 /// Whether an encoder observation-gather failure may try another mode.

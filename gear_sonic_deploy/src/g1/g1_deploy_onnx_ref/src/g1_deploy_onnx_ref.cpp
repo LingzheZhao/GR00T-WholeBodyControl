@@ -443,6 +443,7 @@ class G1Deploy {
       MOTOR_FAULT_MONITOR,
       MOTOR_STATUS,
       NONFINITE_MOTOR_STATE,
+      POSITION_LIMIT,
       CONTROL_PROGRESS_TIMEOUT,
       LOWCMD_WRITE_FAILURE,
       ZMQ_WINDOW_STALE,
@@ -655,7 +656,22 @@ class G1Deploy {
     double initial_max_close_ratio_ = 1.0;
 
     bool enable_dex3_hands_ = true;
-    
+
+    // Opt-in physical-safety controls.  Both default OFF so that the shipped
+    // behaviour is unchanged unless an operator asks for them, and both print
+    // a startup warning saying they are off on a physical runtime.
+    //
+    // Measured joint-position fault: latches POSITION_LIMIT and damps when a
+    // MEASURED joint leaves the G1 hard range.  Independent of the
+    // unconditional commanded-target clamp, which only bounds what is asked.
+    bool measured_position_limit_fault_enabled_ = false;
+    // Per-step command envelope, in radians, applied to every 50 Hz target
+    // against the previously executed wire target.  <= 0 means disabled.
+    double command_max_delta_rad_ = 0.0;
+    // Engagement counter for the step limiter, so a run that is being shaped
+    // by the envelope says so in its log instead of silently deviating.
+    uint64_t command_step_limit_engagements_ = 0;
+
     // Track if vr_3point_compliance is observed by the policy
     // If false, adjusting compliance via keyboard has no effect on the policy
     bool has_vr_3point_compliance_obs_ = false;
@@ -2805,6 +2821,8 @@ class G1Deploy {
           return "a motor reported nonzero fault status";
         case SafetyFaultReason::NONFINITE_MOTOR_STATE:
           return "a motor reported non-finite position or velocity";
+        case SafetyFaultReason::POSITION_LIMIT:
+          return "a measured joint position exceeded the G1 hard range";
         case SafetyFaultReason::CONTROL_PROGRESS_TIMEOUT:
           return "the 50 Hz Control producer stopped making successful progress";
         case SafetyFaultReason::LOWCMD_WRITE_FAILURE:
@@ -2874,7 +2892,9 @@ class G1Deploy {
       std::array<double, 3> initial_compliance = {0.05, 0.05, 0.0},
       double initial_max_close_ratio = 1.0,
       bool enable_dex3_hands = true,
-      bool simulation_only = false)
+      bool simulation_only = false,
+      bool measured_position_limit_fault_enabled = false,
+      double command_max_delta_rad = 0.0)
       : time_(0.0),
         publish_dt_(1.0 / sonic::mode5_contract::kWriterRateHz),
         control_dt_(std::chrono::duration<double>(
@@ -2894,6 +2914,9 @@ class G1Deploy {
         initial_vr_3point_compliance_(initial_compliance),
         initial_max_close_ratio_(initial_max_close_ratio),
         enable_dex3_hands_(enable_dex3_hands),
+        measured_position_limit_fault_enabled_(
+            measured_position_limit_fault_enabled),
+        command_max_delta_rad_(command_max_delta_rad),
         //env(ORT_LOGGING_LEVEL_WARNING, "G1Deploy"),
         model_path(model_file_path),
         planner_path(planner_file_path) {
@@ -3966,6 +3989,23 @@ class G1Deploy {
                     << " reports a non-finite measured state" << std::endl;
           return false;
         }
+        // Measured travel, not commanded travel.  The clamp in
+        // CreatePolicyCommand() bounds what we ask for and is unconditional;
+        // it cannot see a joint pushed past its hard limit from outside.  This
+        // check must run after the non-finite test above: a NaN measurement is
+        // reported as NONFINITE_MOTOR_STATE, and the range predicate
+        // deliberately returns false for it.
+        if (measured_position_limit_fault_enabled_ &&
+            sonic::physical_runtime_safety::MeasuredPositionOutsideHardRange(
+                measured_q, G1_JOINT_POSITION_LOWER_LIMITS[i],
+                G1_JOINT_POSITION_UPPER_LIMITS[i])) {
+          LatchSafetyFault(SafetyFaultReason::POSITION_LIMIT);
+          std::cout << "[ERROR] Motor " << i << " measured q=" << measured_q
+                    << " is outside G1 hard range ["
+                    << G1_JOINT_POSITION_LOWER_LIMITS[i] << ", "
+                    << G1_JOINT_POSITION_UPPER_LIMITS[i] << "]" << std::endl;
+          return false;
+        }
       }
 
       return true;
@@ -4414,13 +4454,40 @@ class G1Deploy {
           return false;
         }
 
-        const double executed_target = std::clamp(
-            raw_q_des[i], G1_JOINT_POSITION_LOWER_LIMITS[i],
-            G1_JOINT_POSITION_UPPER_LIMITS[i]);
+        // The previously executed WIRE target: the float the robot actually
+        // received, widened back to double.  Rate-limiting against anything
+        // else (the pre-cast double, say) measures our own rounding.
+        std::optional<double> previous_wire_target;
         if (previous_motor_command) {
           previous_executed_q_des[i] = static_cast<double>(
               previous_motor_command->q_target.at(i));
+          previous_wire_target = previous_executed_q_des[i];
         }
+
+        // Order matters: bound the STEP first, then clamp to the hard range.
+        // A bounded step taken from a previous target near a limit can still
+        // land outside it, so the range clamp has to come last to stay the
+        // unconditional backstop it is.
+        const double step_limited_target =
+            sonic::physical_runtime_safety::LimitCommandStep(
+                raw_q_des[i], previous_wire_target, command_max_delta_rad_);
+        if (step_limited_target != raw_q_des[i]) {
+          if (command_step_limit_engagements_ == 0) {
+            std::cout << "[SAFETY] Per-step command envelope engaged: motor "
+                      << i << " asked for "
+                      << (raw_q_des[i] -
+                          previous_wire_target.value_or(raw_q_des[i]))
+                      << " rad in one 50 Hz step, limited to "
+                      << command_max_delta_rad_
+                      << " rad. The commanded motion is now being shaped by "
+                         "the envelope, not only by the policy." << std::endl;
+          }
+          ++command_step_limit_engagements_;
+        }
+
+        const double executed_target = std::clamp(
+            step_limited_target, G1_JOINT_POSITION_LOWER_LIMITS[i],
+            G1_JOINT_POSITION_UPPER_LIMITS[i]);
         motor_command_tmp.q_target.at(i) = static_cast<float>(executed_target);
         executed_q_des[i] = static_cast<double>(motor_command_tmp.q_target.at(i));
         if (!IsFiniteCommandValue(executed_q_des[i])) {
@@ -5535,6 +5602,13 @@ void PrintUsage(const char* program) {
   std::cout << "  --disable-crc-check: disable CRC validation for MuJoCo simulation" << std::endl;
   std::cout << "  --simulation-only: run against a simulator transport (required with --disable-crc-check)" << std::endl;
   std::cout << "  --disable-dex3-hands: do not create or publish Dex3 hand command channels" << std::endl;
+  std::cout << "  --enable-measured-position-limit-fault: damp and stop when a MEASURED joint leaves" << std::endl;
+  std::cout << "      the G1 hard range. This is not the commanded-target clamp, which is always on" << std::endl;
+  std::cout << "      and only bounds what is asked for; this is the only check on where the robot" << std::endl;
+  std::cout << "      actually is. DEFAULT: OFF." << std::endl;
+  std::cout << "  --command-max-delta-rad <rad>: bound each 50 Hz commanded step to <rad> around the" << std::endl;
+  std::cout << "      previously executed target. Shapes the commanded motion, so a value below what" << std::endl;
+  std::cout << "      the motion legitimately needs will distort it. DEFAULT: OFF (no step bound)." << std::endl;
   std::cout << "  --obs-config <path>: specify observation configuration YAML file" << std::endl;
   std::cout << "  --print-capabilities: with --obs-config, print the SONIC_CAPABILITIES_V1 line and exit (no robot/GPU needed)" << std::endl;
   std::cout << "  --encoder-file <path>: specify encoder ONNX file (optional)" << std::endl;
@@ -5687,6 +5761,10 @@ int main(int argc, char const* argv[]) {
   std::array<double, 3> initial_compliance = {0.5, 0.5, 0.0}; // initial compliance is 0.5 for both hands (keyboard controllable)
   double initial_max_close_ratio = 1.0; // default allows full closure, use --max-close-ratio to limit
   bool enableDex3Hands = true;
+  // Opt-in physical-safety controls; see PrintUsage(). Both default OFF, and
+  // both warn on a physical runtime when they are left off.
+  bool enableMeasuredPositionLimitFault = false;
+  double commandMaxDeltaRad = 0.0;
   for (int i = 4; i < argc; i++) {
     if (std::string(argv[i]) == "--disable-crc-check") {
       disableCrcCheck = true;
@@ -5697,6 +5775,43 @@ int main(int argc, char const* argv[]) {
     } else if (std::string(argv[i]) == "--disable-dex3-hands") {
       enableDex3Hands = false;
       std::cout << "[SAFETY] Dex3 hand actuation disabled" << std::endl;
+    } else if (std::string(argv[i]) ==
+               "--enable-measured-position-limit-fault") {
+      enableMeasuredPositionLimitFault = true;
+      std::cout << "[SAFETY] Measured joint-position limit fault enabled: a "
+                   "measured joint outside the G1 hard range damps and stops"
+                << std::endl;
+    } else if (std::string(argv[i]) == "--command-max-delta-rad") {
+      if (i + 1 < argc) {
+        try {
+          size_t consumed = 0;
+          const std::string raw_value(argv[i + 1]);
+          commandMaxDeltaRad = std::stod(raw_value, &consumed);
+          if (consumed != raw_value.size()) {
+            throw std::invalid_argument("trailing characters");
+          }
+          // A non-finite or non-positive bound would read as "enabled" on the
+          // command line while bounding nothing. Refuse rather than come up
+          // looking guarded.
+          if (!std::isfinite(commandMaxDeltaRad) || commandMaxDeltaRad <= 0.0) {
+            std::cerr << "Error: --command-max-delta-rad must be a finite "
+                         "positive value in radians"
+                      << std::endl;
+            exit(1);
+          }
+          std::cout << "[SAFETY] Per-step command envelope enabled: "
+                    << commandMaxDeltaRad << " rad per 50 Hz step" << std::endl;
+        } catch (const std::exception&) {
+          std::cerr << "Error: Invalid --command-max-delta-rad value: "
+                    << argv[i + 1] << std::endl;
+          exit(1);
+        }
+        i++;  // Skip the next argument since it's the envelope value
+      } else {
+        std::cerr << "Error: --command-max-delta-rad requires a value argument"
+                  << std::endl;
+        exit(1);
+      }
     } else if (std::string(argv[i]) == "--obs-config") {
       if (i + 1 < argc) {
         obsConfigPath = argv[i + 1];
@@ -5945,6 +6060,28 @@ int main(int argc, char const* argv[]) {
     return 1;
   }
 
+  // Say plainly which opt-in physical protections are OFF for this run. Only
+  // on a physical runtime: in simulation these are noise, on hardware they are
+  // the whole point. An operator should never have to infer a protection's
+  // state from the absence of a flag they may not know exists.
+  if (!simulationOnly) {
+    if (!enableMeasuredPositionLimitFault) {
+      std::cout << "[SAFETY] WARNING: measured joint-position limit fault is "
+                   "DISABLED. Commanded targets are still clamped to the G1 "
+                   "hard range, but a joint driven past its limit from outside "
+                   "(a push, gravity, a gear slip) will NOT stop this run. "
+                   "Enable with --enable-measured-position-limit-fault."
+                << std::endl;
+    }
+    if (!(commandMaxDeltaRad > 0.0)) {
+      std::cout << "[SAFETY] WARNING: per-step command envelope is DISABLED. "
+                   "Each 50 Hz target may move a joint anywhere inside its "
+                   "hard range in a single step. Enable with "
+                   "--command-max-delta-rad <rad>."
+                << std::endl;
+    }
+  }
+
   // Install the shutdown handlers BEFORE the controller exists, so a signal
   // that arrives during construction (TensorRT engine builds take minutes) is
   // still latched and honoured by the wait loop below.  Without them SIGINT
@@ -6000,7 +6137,9 @@ int main(int argc, char const* argv[]) {
     initial_compliance,
     initial_max_close_ratio,
     enableDex3Hands,
-    simulationOnly
+    simulationOnly,
+    enableMeasuredPositionLimitFault,
+    commandMaxDeltaRad
   );
   std::cout << "[DEBUG] G1Deploy object created successfully!" << std::endl;
   

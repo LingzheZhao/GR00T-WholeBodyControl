@@ -168,6 +168,7 @@ public:
     bool motion_restart = false;   ///< Restart (frame 0, paused).
     bool start_control = false;    ///< Start control system.
     bool stop_control = false;     ///< Emergency stop.
+    bool rest_stand = false;       ///< Resident re-stand (U): INIT ramp, keep LowCmd.
     bool delta_left = false;       ///< Heading nudge left.
     bool delta_right = false;      ///< Heading nudge right.
     bool reinitialize = false;     ///< Recapture IMU heading.
@@ -357,6 +358,7 @@ public:
         // Reset input flags each frame
         start_control = false;
         stop_control = false;
+        rest_stand = false;
         motion_prev = false;
         motion_next = false;
         play_motion = false;
@@ -390,6 +392,8 @@ public:
                 case ']': start_control = true; break;
                 case 'o':
                 case 'O': stop_control = true; break;
+                case 'u':
+                case 'U': rest_stand = true; break;
                 case 'f':
                 case 'F': report_temperature = true; break;
                 case 'q':
@@ -535,6 +539,7 @@ public:
         if (stop_control) { operator_state.stop = true; }
         if (this->report_temperature) { report_temperature = true; }
         if (start_control) { operator_state.start = true; }
+        if (rest_stand) { operator_state.rest_stand = true; }
 
         // Handle delta heading controls
         if (delta_left) {

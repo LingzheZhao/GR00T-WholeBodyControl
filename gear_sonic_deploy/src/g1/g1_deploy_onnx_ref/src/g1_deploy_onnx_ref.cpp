@@ -23,11 +23,16 @@
  * ## Control-Loop State Machine (ProgramState)
  *
  *   INIT → WAIT_FOR_CONTROL → CONTROL
+ *                    ↑_________________|  resident re-stand (key U)
  *
  *   - **INIT**: Wait for a valid LowState message from the robot.
  *   - **WAIT_FOR_CONTROL**: Robot is ready; wait for operator "start" signal.
  *   - **CONTROL**: Active policy execution – gather observations, infer actions,
  *     write motor commands.  Exits on operator "stop" or error.
+ *   - **Resident re-stand**: From CONTROL or WAIT_FOR_CONTROL, latch the
+ *     current pose and re-run the INIT interpolation with takeover gains.
+ *     The 500 Hz LowCmd writer stays armed; this must never damp or restart
+ *     the process.
  *
  * ## CLI Arguments (selected)
  *
@@ -3944,6 +3949,21 @@ class G1Deploy {
       return true;
     }
 
+    /// Re-enter INIT from CONTROL/WAIT_FOR_CONTROL without releasing LowCmd.
+    ///
+    /// The 500 Hz writer keeps repeating the last command until the next
+    /// InitControl tick publishes takeover-gain targets.  Latch a fresh start
+    /// pose on that tick so the interpolation begins at the robot's current q.
+    void BeginResidentRestStand() {
+      operator_state.play.store(false, std::memory_order_release);
+      operator_state.start.store(false, std::memory_order_release);
+      time_ = 0.0;
+      init_start_q_latched_ = false;
+      reinitialize_heading_ = true;
+      program_state_ = ProgramState::INIT;
+      std::cout << "RESIDENT REST-STAND: BEGIN" << std::endl;
+    }
+
     /// Check for valid LowState data and recent updates; if invalid, transition to ERROR state.
     bool CheckSafety(const RobotStateSnapshot& snapshot) {
       const auto& low_state_data = snapshot.low_state;
@@ -5211,6 +5231,8 @@ class G1Deploy {
      *    8. Handle motion recording (streamed + planner).
      *    9. CurrentFrameAdvancement — advance playback cursor, blend planner.
      *    10. Periodic timing log every 50 ticks (~1 s).
+     *  - Resident re-stand (key U): CONTROL/WAIT_FOR_CONTROL → INIT without
+     *    damping or releasing the 500 Hz LowCmd writer.
      */
     void Control() {
       if (!control_workers_active_.load(std::memory_order_acquire)) { return; }
@@ -5220,6 +5242,15 @@ class G1Deploy {
         return;
       }
       if (operator_state.stop.load(std::memory_order_acquire)) { return; }
+
+      if (operator_state.rest_stand.exchange(false, std::memory_order_acq_rel)) {
+        if (program_state_ == ProgramState::CONTROL ||
+            program_state_ == ProgramState::WAIT_FOR_CONTROL) {
+          BeginResidentRestStand();
+        } else {
+          std::cout << "RESIDENT REST-STAND: IGNORED" << std::endl;
+        }
+      }
 
       switch (program_state_) {
         case ProgramState::INIT:

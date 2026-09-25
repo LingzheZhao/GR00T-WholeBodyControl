@@ -73,6 +73,7 @@ class SimpleKeyboard : public InputInterface {
 
     bool start_control = false;    ///< Request control-system start.
     bool stop_control = false;     ///< Request emergency stop.
+    bool rest_stand = false;       ///< Resident re-stand (U): INIT ramp, keep LowCmd.
 
     bool delta_left = false;       ///< Nudge heading left  (−π/12 rad per press).
     bool delta_right = false;      ///< Nudge heading right (+π/12 rad per press).
@@ -153,6 +154,7 @@ class SimpleKeyboard : public InputInterface {
       // Reset input flags each frame
       start_control = false;
       stop_control = false;
+      rest_stand = false;
       motion_prev = false;
       motion_next = false;
       play_motion = false;
@@ -246,6 +248,8 @@ class SimpleKeyboard : public InputInterface {
                 case ']': start_control = true; break; // Start control system
                 case 'o':
                 case 'O': stop_control = true; break; // Stop/Exit
+                case 'u':
+                case 'U': rest_stand = true; break; // Resident re-stand; keep LowCmd
                 case '\n': use_planner = !use_planner; break; // Use planner
                 case 'i':
                 case 'I': reinitialize = true; break; // Reinitialize base quaternion and delta heading
@@ -306,6 +310,8 @@ class SimpleKeyboard : public InputInterface {
             case ']': start_control = true; break; // Start control system
             case 'o':
             case 'O': stop_control = true; break; // Stop/Exit
+            case 'u':
+            case 'U': rest_stand = true; break; // Resident re-stand; keep LowCmd
             case 'q':
             case 'Q': delta_left = true; break; // Delta heading left (-0.1)
             case 'e':
@@ -435,6 +441,8 @@ class SimpleKeyboard : public InputInterface {
       if (this->report_temperature) { report_temperature = true; }
 
       if (this->start_control) { operator_state.start = true; }
+
+      if (this->rest_stand) { operator_state.rest_stand = true; }
 
       // Handle delta heading controls
       if (this->delta_left) {

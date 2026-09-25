@@ -206,6 +206,15 @@ xrobotoolkit_sdk.cpython-*-*-*.so
 teleop_vids/
 *.code-workspace
 # Motion/training data (large local datasets, not tracked in git)
+# Robot captures and experiment outputs are local, never uploaded via LFS.
+/gear_sonic_deploy/reference/recorded_motion/
+artifacts/
+results/
+*.mp4
+*.mov
+*.webm
+*.avi
+*.mkv
 data/
 bones_seed_smpl/
 sonic_release/

@@ -103,6 +103,9 @@ struct OperatorState {
   std::atomic<bool> stop{false};   ///< Emergency stop requested.
   std::atomic<bool> start{false};  ///< Control-system start requested.
   std::atomic<bool> play{false};   ///< Motion playback active.
+  /// Resident re-stand: ramp back to the INIT pose without damping or
+  /// releasing LowCmd.  Consumed by the 50 Hz control thread.
+  std::atomic<bool> rest_stand{false};
 };
 
 /**
